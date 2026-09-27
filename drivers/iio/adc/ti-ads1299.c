@@ -170,13 +170,42 @@
 #define ADS1299_CAL_FREQ_DC			3
 
 #define ADS1299_REG_CONFIG3	0x03
-/* [SBAS499?] CONFIG3 reset value 0x60; bits 6:5 reserved and must be 1 */
-#define ADS1299_MASK_CONFIG3_PWR_REFBUF		BIT(7)
+/*
+ * [SBAS499 Table 15 / Figure 53] CONFIG3, reset 0x60.
+ *
+ * Every field below sits where the datasheet puts it. Two notes for whoever
+ * checks it next.
+ *
+ * The reserved field 6:5 must always be written 3h, and 3h happens to be "both
+ * bits set", so here the mask and the mandated value coincide. That is a
+ * coincidence of this register and not a rule - CONFIG2's reserved field is 6h
+ * over three bits - so the value is spelled out with FIELD_PREP anyway, and the
+ * two registers read the same way.
+ *
+ * The datasheet calls bit 7 PD_REFBUF, "power-down reference buffer", and then
+ * gives it inverted polarity: 0 powers the buffer DOWN, 1 enables it. The macro
+ * is named for what setting it does, because "val |= PD_REFBUF" to power
+ * something down is a bug waiting to be written. The datasheet name is recorded
+ * here so a search for PD_REFBUF finds it.
+ */
+#define ADS1299_MASK_CONFIG3_PWR_REFBUF		BIT(7)	/* datasheet: PD_REFBUF */
 #define ADS1299_MASK_CONFIG3_RESERVED		GENMASK(6, 5)
+#define ADS1299_CONFIG3_RESERVED_VALUE					\
+	FIELD_PREP(ADS1299_MASK_CONFIG3_RESERVED, 0x3)
 #define ADS1299_MASK_CONFIG3_BIAS_MEAS		BIT(4)
 #define ADS1299_MASK_CONFIG3_BIASREF_INT	BIT(3)
 #define ADS1299_MASK_CONFIG3_PD_BIAS		BIT(2)
 #define ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS	BIT(1)
+/*
+ * Bit 0 is BIAS_STAT, read-only, the lead-off status of the BIAS electrode: 0
+ * connected, 1 not connected. It has a macro and no user.
+ *
+ * Reporting it is not just an attribute: CONFIG3 is cached (REGCACHE_MAPLE, and
+ * the volatile table covers only LOFF_STATP..LOFF_STATN), so a read would come
+ * back as the value that was written and this bit would report "connected"
+ * forever. The register has to join the volatile table in the same change.
+ */
+#define ADS1299_MASK_CONFIG3_BIAS_STAT		BIT(0)
 
 #define ADS1299_REG_LOFF	0x04
 #define ADS1299_REG_CHnSET(n)	(0x05 + (n))
@@ -1195,7 +1224,7 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	 * PWR_REFBUF the converter has no reference at all unless one is wired,
 	 * and every channel reads zero.
 	 */
-	val = ADS1299_MASK_CONFIG3_RESERVED;
+	val = ADS1299_CONFIG3_RESERVED_VALUE;
 	if (!priv->reg_vref)
 		val |= ADS1299_MASK_CONFIG3_PWR_REFBUF |
 		       ADS1299_MASK_CONFIG3_BIASREF_INT;
