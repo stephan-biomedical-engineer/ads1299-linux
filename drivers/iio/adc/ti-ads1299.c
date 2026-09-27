@@ -121,7 +121,23 @@
 #define ADS1299_ID_FAMILY_ADS129X		0x7
 
 #define ADS1299_REG_CONFIG1	0x01
-#define ADS1299_MASK_CONFIG1_RESERVED		BIT(7)	/* [SBAS499?] must be 1 */
+/*
+ * [SBAS499 Table 13 / Figure 51] CONFIG1, reset 0x96.
+ *
+ * TWO reserved fields: bit 7 must always be written 1, and bits 4:3 must
+ * always be written 2h. 0x90 is the two of them together, and 0x90 | DR is the
+ * whole register - 0x96 at the reset data rate.
+ *
+ * CONFIG1 is only ever touched with regmap_update_bits() on the DR field, so
+ * these bits keep the value the part came up with. The full value is spelled
+ * out anyway: reaching for BIT(7) alone as a "reserved value", the way CONFIG2
+ * and CONFIG3 are written whole, would clear bit 4 on every rate change.
+ */
+#define ADS1299_MASK_CONFIG1_RESERVED_HI	BIT(7)
+#define ADS1299_MASK_CONFIG1_RESERVED_LO	GENMASK(4, 3)
+#define ADS1299_CONFIG1_RESERVED_VALUE					\
+	(ADS1299_MASK_CONFIG1_RESERVED_HI |				\
+	 FIELD_PREP(ADS1299_MASK_CONFIG1_RESERVED_LO, 0x2))
 #define ADS1299_MASK_CONFIG1_DAISY_EN		BIT(6)
 #define ADS1299_MASK_CONFIG1_CLK_EN		BIT(5)
 #define ADS1299_MASK_CONFIG1_DR			GENMASK(2, 0)
