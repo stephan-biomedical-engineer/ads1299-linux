@@ -216,6 +216,22 @@
 
 #define ADS1299_REG_BIAS_SENSP	0x0d
 #define ADS1299_REG_BIAS_SENSN	0x0e
+/*
+ * [SBAS499 Tables 20, 21 / Figures 58, 59] One bit per electrode, and this
+ * driver never writes either of them.
+ *
+ * The datasheet is explicit: the LOFF_STATP bits are only valid where the
+ * corresponding LOFF_SENSP bit is set, and the same holds for the negative
+ * side. Powering the comparators on in CONFIG4 is therefore only half of what
+ * lead-off detection needs. With SENSP/SENSN left at 0, LOFF_STATP and
+ * LOFF_STATN read 00 00, which is indistinguishable from every electrode being
+ * attached.
+ *
+ * Until detection is enabled per channel, lead_off_status says "disabled"
+ * rather than emitting a number the datasheet says to ignore. Enabling it
+ * drives the lead-off current into the electrodes, and its magnitude and
+ * frequency come from LOFF (0x04), which nothing here programs either.
+ */
 #define ADS1299_REG_LOFF_SENSP	0x0f
 #define ADS1299_REG_LOFF_SENSN	0x10
 #define ADS1299_REG_LOFF_FLIP	0x11
@@ -934,9 +950,28 @@ static ssize_t lead_off_status_show(struct device *dev,
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int sensp;
+	unsigned int sensn;
 	unsigned int statp;
 	unsigned int statn;
 	int ret;
+
+	/*
+	 * A status bit is only valid where its channel has lead-off sensing
+	 * enabled. Reporting the raw registers would print 00 00 - every
+	 * electrode attached - on a device where detection was never switched
+	 * on.
+	 */
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSP, &sensp);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSN, &sensn);
+	if (ret)
+		return ret;
+
+	if (!sensp && !sensn)
+		return sysfs_emit(buf, "disabled\n");
 
 	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_STATP, &statp);
 	if (ret)
@@ -946,8 +981,8 @@ static ssize_t lead_off_status_show(struct device *dev,
 	if (ret)
 		return ret;
 
-	/* One bit per electrode, positive then negative. */
-	return sysfs_emit(buf, "%02x %02x\n", statp, statn);
+	/* One bit per electrode, positive then negative, valid bits only. */
+	return sysfs_emit(buf, "%02x %02x\n", statp & sensp, statn & sensn);
 }
 
 static ssize_t lost_samples_show(struct device *dev,
@@ -1248,7 +1283,11 @@ static int ads1299_init(struct iio_dev *indio_dev)
 			return ret;
 	}
 
-	/* Lead-off comparators on, so lead_off_status means something */
+	/*
+	 * Lead-off comparators powered on. Not the same as lead-off detection
+	 * being enabled: that needs LOFF_SENSP/LOFF_SENSN per channel, which
+	 * nothing here writes - see the note at their definitions.
+	 */
 	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
 				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
 				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP);
