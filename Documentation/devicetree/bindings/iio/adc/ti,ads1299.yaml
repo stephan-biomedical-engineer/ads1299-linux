@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/adc/ti,ads1299.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Texas Instruments ADS1299 biopotential analog front-end
+
+maintainers:
+  - stephan-biomedical-engineer <stephanbrrs8@gmail.com>
+
+description: |
+  Texas Instruments ADS1299 family: low-noise, 24-bit, simultaneous-sampling
+  biopotential (EEG) analog front-ends with an SPI interface. The ADS1299 has
+  eight channels, the ADS1299-6 six and the ADS1299-4 four.
+
+  Each channel has its own programmable gain amplifier and a multiplexer that
+  can select the electrode inputs, a shorted input, the internal test signal,
+  the supply or the temperature sensor. The part also provides lead-off
+  detection and a bias drive amplifier for the driven reference electrode.
+
+  The converter signals a completed conversion on its DRDY output and is read
+  over SPI in mode 1 (CPOL=0, CPHA=1).
+
+  https://www.ti.com/lit/gpn/ads1299
+
+properties:
+  compatible:
+    enum:
+      - ti,ads1299
+      - ti,ads1299-4
+      - ti,ads1299-6
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description:
+      The DRDY output of the converter, asserted low when a conversion is
+      ready to be read. It is how a host knows that a sample exists, and a
+      conversion whose completion is never signalled can only be guessed at
+      from elapsed time.
+
+  reset-gpios:
+    maxItems: 1
+    description: The active-low RESET input of the converter.
+
+  clocks:
+    maxItems: 1
+    description:
+      External clock on the CLK pin, used when the CLKSEL pin selects an
+      external clock. Omit when the part runs from its internal oscillator.
+
+  clock-names:
+    const: clk
+
+  avdd-supply:
+    description: Analog supply.
+
+  vref-supply:
+    description:
+      External voltage reference on VREFP. Omit to use the internal 4.5 V
+      reference.
+
+  spi-cpha: true
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - avdd-supply
+  - spi-cpha
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        adc@0 {
+            compatible = "ti,ads1299";
+            reg = <0>;
+            spi-max-frequency = <4000000>;
+            spi-cpha;
+            interrupt-parent = <&gpio1>;
+            interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+            reset-gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
+            avdd-supply = <&reg_avdd>;
+        };
+    };
