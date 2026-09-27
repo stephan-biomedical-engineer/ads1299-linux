@@ -134,10 +134,20 @@
 #define ADS1299_LOWEST_DR			0x06
 
 #define ADS1299_REG_CONFIG2	0x02
-/* [SBAS499?] CONFIG2 reset value 0xc0; bits 7:6 reserved and must be 1 */
-#define ADS1299_MASK_CONFIG2_RESERVED		GENMASK(7, 6)
-#define ADS1299_MASK_CONFIG2_INT_CAL		BIT(5)
-#define ADS1299_MASK_CONFIG2_CAL_AMP		BIT(3)
+/*
+ * [SBAS499 Table 14 / Figure 52] CONFIG2, reset 0xc0.
+ *
+ * There are TWO reserved fields here and neither is don't-care: bits 7:5 must
+ * always be written 6h, and bit 3 must always be written 0. The reserved bits
+ * are therefore a VALUE and not a mask of ones - writing GENMASK(7, 5) would
+ * put 7h into a field the datasheet says is always 6h.
+ */
+#define ADS1299_MASK_CONFIG2_RESERVED		GENMASK(7, 5)
+#define ADS1299_CONFIG2_RESERVED_VALUE					\
+	FIELD_PREP(ADS1299_MASK_CONFIG2_RESERVED, 0x6)
+#define ADS1299_MASK_CONFIG2_INT_CAL		BIT(4)
+/* Bit 3 is the second reserved field, always 0, so it gets no macro. */
+#define ADS1299_MASK_CONFIG2_CAL_AMP		BIT(2)
 #define ADS1299_MASK_CONFIG2_CAL_FREQ		GENMASK(1, 0)
 #define ADS1299_CAL_FREQ_SLOW			0	/* f_CLK / 2^21, ~1 Hz */
 #define ADS1299_CAL_FREQ_FAST			1	/* f_CLK / 2^20, ~2 Hz */
@@ -850,7 +860,7 @@ static ssize_t test_signal_store(struct device *dev,
 	};
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
-	unsigned int val = ADS1299_MASK_CONFIG2_RESERVED;
+	unsigned int val = ADS1299_CONFIG2_RESERVED_VALUE;
 	int choice;
 	int ret;
 
@@ -1160,7 +1170,7 @@ static int ads1299_init(struct iio_dev *indio_dev)
 
 	/* Internal test generator available but not routed to any channel */
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-			   ADS1299_MASK_CONFIG2_RESERVED);
+			   ADS1299_CONFIG2_RESERVED_VALUE);
 	if (ret)
 		return ret;
 
@@ -1297,7 +1307,7 @@ static int ads1299_self_test(struct ads1299_private *priv)
 
 	/* Step 1 - the internal generator, 1x amplitude, slow */
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-			   ADS1299_MASK_CONFIG2_RESERVED |
+			   ADS1299_CONFIG2_RESERVED_VALUE |
 			   ADS1299_MASK_CONFIG2_INT_CAL |
 			   FIELD_PREP(ADS1299_MASK_CONFIG2_CAL_FREQ,
 				      ADS1299_CAL_FREQ_SLOW));
@@ -1317,7 +1327,7 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	/* Step 2 - inputs shorted, generator off */
 	if (!ret)
 		ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-				   ADS1299_MASK_CONFIG2_RESERVED);
+				   ADS1299_CONFIG2_RESERVED_VALUE);
 	if (!ret)
 		ret = ads1299_set_mux(priv, ADS1299_MUX_SHORTED);
 	if (!ret)
@@ -1332,7 +1342,7 @@ static int ads1299_self_test(struct ads1299_private *priv)
 
 	/* Pass or fail, the inputs go back to the electrodes */
 	restore = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-			       ADS1299_MASK_CONFIG2_RESERVED);
+			       ADS1299_CONFIG2_RESERVED_VALUE);
 	if (!restore)
 		restore = ads1299_set_mux(priv, ADS1299_MUX_NORMAL);
 
