@@ -60,12 +60,14 @@
  *    drivers/iio/imu/adis.c, ak8974_selftest() in the magnetometer driver).
  *  - An input MUX control, for bench work on the analogue path.
  *
- * DATASHEET VALUES ARE UNVERIFIED. Every constant below marked [SBAS499?] was
- * written from the ADS1299 register map as understood here and has NOT been
- * checked against the datasheet or against silicon. They are collected at the
- * top of the file, in one place, precisely so that checking them is a single
- * pass. Until that pass happens they are debt, in the sense
- * BRINGUP_STM32MP2.md §11 rule 1 gives the word.
+ * DATASHEET STATUS. The register map has been read against SBAS499 Table 11 and
+ * the per-register tables 12 to 28, and each constant carries its table number.
+ * What is still marked [SBAS499?] is what the datasheet does not settle, and
+ * there is exactly one: the test generator's amplitude, which decides whether
+ * the probe-time self test passes on good silicon.
+ *
+ * Nothing here has been checked against SILICON. Checked against the datasheet
+ * and checked against the part are different claims.
  */
 
 #include <linux/bitfield.h>
@@ -108,13 +110,19 @@
 /* Registers */
 #define ADS1299_REG_ID		0x00
 /*
- * [SBAS499?] ID is REV_ID[7:5] | 1 | DEV_ID[3:2] | NU_CH[1:0], and the reset
+ * [SBAS499 Table 12 / Figure 50]
+ * ID is REV_ID[7:5] | 1 | DEV_ID[3:2] | NU_CH[1:0], and the reset
  * value of the 8-channel part is 0x3e. So the part-identifying field is
  * bits [4:2] = 0b111, and the channel count is a TWO bit field - not the three
  * bit field the ADS1298 has, whose bit 2 belongs to DEV_ID here. Using the
  * mainline masks unmodified would decode an ADS1299 as a 16-channel unknown
  * device, which is a good failure (it refuses to probe) but for the wrong
  * reason.
+ *
+ * 0x3e is the reset value of ONE revision: REV_ID is documented as subject to
+ * change without notice, so the whole byte must never be compared. The code
+ * below masks. NU_CH: 00 is 4 channels, 01 is 6, 10 is 8, and 11 is undefined,
+ * which is why the > MAX_CHANNELS test is a guard and not decoration.
  */
 #define ADS1299_MASK_ID_FAMILY			GENMASK(4, 2)
 #define ADS1299_MASK_ID_CHANNELS		GENMASK(1, 0)
@@ -207,7 +215,15 @@
  */
 #define ADS1299_MASK_CONFIG3_BIAS_STAT		BIT(0)
 
+/*
+ * [SBAS499 Table 16] LOFF, reset 0x00: COMP_TH[7:5], reserved bit 4, written 0,
+ * ILEAD_OFF[3:2], FLEAD_OFF[1:0]. This driver never writes it, so the part
+ * keeps its reset value - comparator thresholds 95%/5%, DC lead-off detection,
+ * 6 nA. That is a device-configuration choice made by leaving the register at
+ * reset; see the note on LOFF_SENSP below.
+ */
 #define ADS1299_REG_LOFF	0x04
+/* [SBAS499 Table 17 / Figure 55] CHnSET, reset 0x61 */
 #define ADS1299_REG_CHnSET(n)	(0x05 + (n))
 #define ADS1299_MASK_CH_PD		BIT(7)
 #define ADS1299_MASK_CH_PGA		GENMASK(6, 4)
@@ -241,7 +257,11 @@
 #define ADS1299_REG_MISC1	0x15
 #define ADS1299_REG_MISC2	0x16
 #define ADS1299_REG_CONFIG4	0x17
-/* [SBAS499?] bit positions in CONFIG4 are the least certain in this file */
+/*
+ * [SBAS499 Table 28 / Figure 66] CONFIG4, reset 0x00. Note the inverted name,
+ * the same shape as PD_REFBUF: the field is called PD_LOFF_COMP, "lead-off
+ * comparator power-down", and 1 ENABLES the comparators.
+ */
 #define ADS1299_MASK_CONFIG4_SINGLE_SHOT	BIT(3)
 #define ADS1299_MASK_CONFIG4_PD_LOFF_COMP	BIT(1)
 
@@ -274,9 +294,23 @@
 /*
  * Probe-time self test criteria.
  *
- * [SBAS499?] The generator swings +-VREF/2400 at 1x amplitude, so its peak to
- * peak is VREF/1200 - and in CODES that is gain * 2^23 / 1200 whatever the
- * reference is, which is why the check below needs no reference at all.
+ * [SBAS499? - THE DATASHEET DOES NOT SETTLE THIS. Measure on silicon.]
+ *
+ * Table 14 gives the test signal amplitude as "1 x -(VREFP - VREFN) / 2400" and
+ * does not say whether that is a peak, a peak-to-peak or a differential step.
+ * The two readings differ by a factor of two:
+ *
+ *   peak-to-peak = VREF/1200  ->  3.75 mV at a 4.5 V reference  (assumed here)
+ *   peak-to-peak = VREF/2400  ->  1.875 mV
+ *
+ * If VREF/2400 is the right one, the check below expects twice the real swing
+ * and this self test fails on good silicon: the front-end is not registered,
+ * userspace finds no device, and the cause is one factor of two. The number is
+ * deliberately NOT changed here - a guess that makes a self test pass is worse
+ * than one that makes it fail.
+ *
+ * In CODES the expectation is gain * 2^23 / divisor whatever the reference is,
+ * which is why the check needs no reference at all - that part holds either way.
  */
 #define ADS1299_TEST_SIGNAL_PP_DIVISOR		1200
 /* +-20%: wider than any reference tolerance, narrower than a dead PGA stage */
@@ -403,7 +437,14 @@ static const int ads1299_samp_freq_avail[] = {
 	16000, 8000, 4000, 2000, 1000, 500, 250,
 };
 
-/* PGA setting -> gain, indexed by the CHnSET PGA field. [SBAS499?] */
+/*
+ * PGA setting -> gain, indexed by the CHnSET PGA field.
+ * [SBAS499 Table 17] 000..110 exactly; 111 is "do not use", which is why this
+ * array has seven entries and not eight - an index of 7 is out of bounds by
+ * construction rather than by a check that could be forgotten. The ADS1298's
+ * table is {6,1,2,3,4,8,12}, so carrying it over would be a silent 4x scale
+ * error at the reset setting.
+ */
 static const int ads1299_pga_gain[] = { 1, 2, 4, 6, 8, 12, 24 };
 
 static const char * const ads1299_mux_names[] = {
