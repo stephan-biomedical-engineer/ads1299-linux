@@ -230,8 +230,18 @@
 #define ADS1299_MASK_CH_SRB2		BIT(3)
 #define ADS1299_MASK_CH_MUX		GENMASK(2, 0)
 
+/*
+ * [SBAS499 Tables 18, 19 / Figures 56, 57] One bit per electrode: which channel
+ * inputs are averaged to derive the bias the amplifier drives back out.
+ *
+ * The bits above the part's channel count do not exist - [5:4] on the
+ * ADS1299-4, [7:6] on the -4 and the -6 - and the datasheet says to write 0
+ * there. Deriving the mask from num_adc_channels, which comes from the ID
+ * register, satisfies that without a variant table.
+ */
 #define ADS1299_REG_BIAS_SENSP	0x0d
 #define ADS1299_REG_BIAS_SENSN	0x0e
+
 /*
  * [SBAS499 Tables 20, 21 / Figures 58, 59] One bit per electrode, and this
  * driver never writes either of them.
@@ -247,6 +257,10 @@
  * rather than emitting a number the datasheet says to ignore. Enabling it
  * drives the lead-off current into the electrodes, and its magnitude and
  * frequency come from LOFF (0x04), which nothing here programs either.
+ *
+ * This comment used to sit above the two BIAS registers and cite these table
+ * numbers for them, which are the lead-off ones. The registers it describes are
+ * below it now.
  */
 #define ADS1299_REG_LOFF_SENSP	0x0f
 #define ADS1299_REG_LOFF_SENSN	0x10
@@ -264,6 +278,35 @@
  */
 #define ADS1299_MASK_CONFIG4_SINGLE_SHOT	BIT(3)
 #define ADS1299_MASK_CONFIG4_PD_LOFF_COMP	BIT(1)
+
+/*
+ * What the bias amplifier is doing, and the names say which because the three
+ * are clinically different and a boolean cannot tell them apart.
+ *
+ *   off       - the buffer is powered down. Reset state, and what this driver
+ *               did before this existed.
+ *   reference - the buffer drives BIASREF, generated internally as
+ *               (AVDD + AVSS) / 2. A DC bias for the subject and NO active
+ *               common-mode rejection: nothing measured feeds back.
+ *   derived   - the buffer drives the inverse of the average of every enabled
+ *               channel's inputs, which is the driven-electrode arrangement
+ *               that actually rejects common mode.
+ *
+ * "bias drive is on" in a prescription means derived. reference exists because
+ * the part can do it and because a montage might want a bias with no feedback,
+ * not because anything here asks for it yet.
+ */
+enum ads1299_bias {
+	ADS1299_BIAS_OFF,
+	ADS1299_BIAS_REFERENCE,
+	ADS1299_BIAS_DERIVED,
+};
+
+static const char * const ads1299_bias_names[] = {
+	[ADS1299_BIAS_OFF]	 = "off",
+	[ADS1299_BIAS_REFERENCE] = "reference",
+	[ADS1299_BIAS_DERIVED]	 = "derived",
+};
 
 /* MUX field of CHnSET - what the channel is actually connected to */
 #define ADS1299_MUX_NORMAL		0
@@ -368,6 +411,7 @@ struct ads1299_private {
 
 	/* Number of ADC channels the chip reported; excludes the timestamp */
 	unsigned int num_adc_channels;
+	enum ads1299_bias bias;
 
 	enum ads1299_timestamp_source ts_source;
 	struct hrtimer timer;		/* only used when ts_source is HOST_TIMER */
@@ -932,6 +976,115 @@ static ssize_t input_mux_available_show(struct device *dev,
 	return (ssize_t)len;
 }
 
+/*
+ * Program the bias amplifier. Caller holds nothing; regmap serialises the
+ * register access and the three writes are not required to be atomic with
+ * respect to each other, because the derivation registers only matter while
+ * PD_BIAS is set and that bit is written last on the way up and first on the
+ * way down.
+ *
+ * BIASREF_INT travels with the bias and not with the ADC reference. It used to
+ * be written at probe alongside PWR_REFBUF, conditioned on whether an external
+ * reference regulator exists - which conflated two different references: bit 7
+ * is the ADC's reference buffer and bit 3 is the bias amplifier's reference.
+ * An external VREF says nothing about how BIASREF is fed. With the amplifier
+ * powered down the bit had no effect, so nothing was wrong on any board; it
+ * would have become wrong here.
+ */
+static int ads1299_set_bias(struct ads1299_private *priv,
+			    enum ads1299_bias mode)
+{
+	unsigned int derivation = 0;
+	unsigned int config3 = 0;
+	int ret;
+
+	if (mode == ADS1299_BIAS_DERIVED)
+		derivation = GENMASK(priv->num_adc_channels - 1, 0);
+	if (mode != ADS1299_BIAS_OFF)
+		config3 = ADS1299_MASK_CONFIG3_BIASREF_INT |
+			  ADS1299_MASK_CONFIG3_PD_BIAS;
+
+	if (mode == ADS1299_BIAS_OFF) {
+		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+					 ADS1299_MASK_CONFIG3_BIASREF_INT |
+					 ADS1299_MASK_CONFIG3_PD_BIAS, 0);
+		if (ret)
+			return ret;
+	}
+
+	ret = regmap_write(priv->regmap, ADS1299_REG_BIAS_SENSP, derivation);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->regmap, ADS1299_REG_BIAS_SENSN, derivation);
+	if (ret)
+		return ret;
+
+	if (mode != ADS1299_BIAS_OFF) {
+		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+					 ADS1299_MASK_CONFIG3_BIASREF_INT |
+					 ADS1299_MASK_CONFIG3_PD_BIAS, config3);
+		if (ret)
+			return ret;
+	}
+
+	priv->bias = mode;
+
+	return 0;
+}
+
+static ssize_t bias_drive_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+
+	return sysfs_emit(buf, "%s\n", ads1299_bias_names[priv->bias]);
+}
+
+static ssize_t bias_drive_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	int mode;
+	int ret;
+
+	mode = sysfs_match_string(ads1299_bias_names, buf);
+	if (mode < 0)
+		return mode;
+
+	/*
+	 * Not while running. Changing what the amplifier drives into the
+	 * subject halfway through a recording would put two different bias
+	 * configurations in one record with nothing to say where the boundary
+	 * is.
+	 */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = ads1299_set_bias(priv, mode);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t bias_drive_available_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ads1299_bias_names); i++)
+		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
+				     ads1299_bias_names[i]);
+
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+
 static ssize_t test_signal_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -1049,6 +1202,8 @@ static ssize_t timestamp_source_show(struct device *dev,
 static IIO_DEVICE_ATTR_RW(input_mux, 0);
 static IIO_DEVICE_ATTR_RO(input_mux_available, 0);
 static IIO_DEVICE_ATTR_RW(test_signal, 0);
+static IIO_DEVICE_ATTR_RW(bias_drive, 0);
+static IIO_DEVICE_ATTR_RO(bias_drive_available, 0);
 static IIO_DEVICE_ATTR_RO(lead_off_status, 0);
 static IIO_DEVICE_ATTR_RO(lost_samples, 0);
 static IIO_DEVICE_ATTR_RO(timestamp_source, 0);
@@ -1057,6 +1212,8 @@ static struct attribute *ads1299_attributes[] = {
 	&iio_dev_attr_input_mux.dev_attr.attr,
 	&iio_dev_attr_input_mux_available.dev_attr.attr,
 	&iio_dev_attr_test_signal.dev_attr.attr,
+	&iio_dev_attr_bias_drive.dev_attr.attr,
+	&iio_dev_attr_bias_drive_available.dev_attr.attr,
 	&iio_dev_attr_lead_off_status.dev_attr.attr,
 	&iio_dev_attr_lost_samples.dev_attr.attr,
 	&iio_dev_attr_timestamp_source.dev_attr.attr,
@@ -1296,15 +1453,31 @@ static int ads1299_init(struct iio_dev *indio_dev)
 		return ret;
 
 	/*
-	 * Internal reference buffer and the internal bias reference. Without
-	 * PWR_REFBUF the converter has no reference at all unless one is wired,
-	 * and every channel reads zero.
+	 * The internal reference buffer. Without PWR_REFBUF the converter has
+	 * no reference at all unless one is wired, and every channel reads
+	 * zero.
+	 *
+	 * BIASREF_INT is deliberately NOT set here any more. It is the bias
+	 * amplifier's reference, not the ADC's, and tying it to whether an
+	 * external VREF regulator exists conflated the two - bit 7 and bit 3 of
+	 * the same register answer different questions. It now travels with the
+	 * bias configuration, in ads1299_set_bias().
 	 */
 	val = ADS1299_CONFIG3_RESERVED_VALUE;
 	if (!priv->reg_vref)
-		val |= ADS1299_MASK_CONFIG3_PWR_REFBUF |
-		       ADS1299_MASK_CONFIG3_BIASREF_INT;
+		val |= ADS1299_MASK_CONFIG3_PWR_REFBUF;
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG3, val);
+	if (ret)
+		return ret;
+
+	/*
+	 * Bias off, written rather than assumed. It is the reset state and the
+	 * register write above already cleared PD_BIAS, but the derivation
+	 * registers are not touched by that write and a part that was left
+	 * configured by something else would keep them. An amplifier that
+	 * drives a subject is not a thing to leave at whatever it was.
+	 */
+	ret = ads1299_set_bias(priv, ADS1299_BIAS_OFF);
 	if (ret)
 		return ret;
 
