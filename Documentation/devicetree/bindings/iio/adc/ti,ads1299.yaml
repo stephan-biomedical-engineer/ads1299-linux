@@ -47,9 +47,9 @@ properties:
     maxItems: 1
     description:
       The DRDY output of the converter, asserted low when a conversion is
-      ready to be read. It is how a host knows that a sample exists, and a
-      conversion whose completion is never signalled can only be guessed at
-      from elapsed time.
+      ready to be read. Omit when DRDY cannot reach the host as an
+      interrupt, as behind a USB-SPI bridge; conversions are then read on
+      a host timer, and their timestamps are the host's.
 
   reset-gpios:
     maxItems: 1
@@ -124,7 +124,6 @@ properties:
 required:
   - compatible
   - reg
-  - interrupts
   - avdd-supply
   - spi-cpha
 
