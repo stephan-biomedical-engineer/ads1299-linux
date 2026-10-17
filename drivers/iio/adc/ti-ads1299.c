@@ -274,6 +274,14 @@ static const char * const ads1299_bias_names[] = { "off", "on" };
 #define ADS1299_MVDD_ANALOG_CHANNEL		0
 #define ADS1299_MVDD_DIGITAL_CHANNEL		2
 
+/*
+ * [SBAS499 Electrical Characteristics] From power-up to DRDY low, and the
+ * internal reference's start-up: 150 ms. Out of standby: 31.25 us, and 4 tCLK
+ * before the next command.
+ */
+#define ADS1299_START_UP_MS			150
+#define ADS1299_WAKEUP_USECS			32
+
 /* Internal reference, used when no "vref" regulator is given */
 #define ADS1299_INTERNAL_VREF_UV		4500000
 
@@ -285,6 +293,11 @@ enum ads1299_timestamp_source {
 struct ads1299_private {
 	struct spi_device *spi;
 	struct regulator *reg_avdd;
+	struct gpio_desc *reset_gpio;
+	struct gpio_desc *powerdown_gpio;
+	/* Across a system suspend: CONFIG3, volatile, and a running buffer */
+	u8 config3_saved;
+	bool resume_running;
 	struct regulator *reg_vref;
 	struct regulator *reg_biasref;
 	struct clk *clk;
@@ -2056,15 +2069,10 @@ static enum hrtimer_restart ads1299_timer_fired(struct hrtimer *timer)
 	return priv->timer_running ? HRTIMER_RESTART : HRTIMER_NORESTART;
 }
 
-static int ads1299_buffer_postenable(struct iio_dev *indio_dev)
+/* Continuous conversions, on DRDY or on the host timer */
+static int ads1299_start_conversions(struct ads1299_private *priv)
 {
-	struct ads1299_private *priv = iio_priv(indio_dev);
 	int ret;
-
-	priv->lost_samples = 0;
-	/* An electrode already off raises its event at the first conversion */
-	priv->loff_offp = 0;
-	priv->loff_offn = 0;
 
 	/* Disable single-shot mode */
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
@@ -2085,16 +2093,31 @@ static int ads1299_buffer_postenable(struct iio_dev *indio_dev)
 	return 0;
 }
 
-static int ads1299_buffer_predisable(struct iio_dev *indio_dev)
+static int ads1299_stop_conversions(struct ads1299_private *priv)
 {
-	struct ads1299_private *priv = iio_priv(indio_dev);
-
 	if (priv->ts_source == ADS1299_TS_HOST_TIMER) {
 		priv->timer_running = false;
 		hrtimer_cancel(&priv->timer);
 	}
 
 	return ads1299_write_cmd(priv, ADS1299_CMD_STOP);
+}
+
+static int ads1299_buffer_postenable(struct iio_dev *indio_dev)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+
+	priv->lost_samples = 0;
+	/* An electrode already off raises its event at the first conversion */
+	priv->loff_offp = 0;
+	priv->loff_offn = 0;
+
+	return ads1299_start_conversions(priv);
+}
+
+static int ads1299_buffer_predisable(struct iio_dev *indio_dev)
+{
+	return ads1299_stop_conversions(iio_priv(indio_dev));
 }
 
 static const struct iio_buffer_setup_ops ads1299_setup_ops = {
@@ -2144,12 +2167,24 @@ static const struct regmap_access_table ads1299_regmap_volatile = {
 	.n_yes_ranges = ARRAY_SIZE(ads1299_regmap_volatile_range),
 };
 
+/* Read only: what a regcache_sync() must not write back */
+static const struct regmap_range ads1299_regmap_read_only_range[] = {
+	regmap_reg_range(ADS1299_REG_ID, ADS1299_REG_ID),
+	regmap_reg_range(ADS1299_REG_LOFF_STATP, ADS1299_REG_LOFF_STATN),
+};
+
+static const struct regmap_access_table ads1299_regmap_writeable = {
+	.no_ranges = ads1299_regmap_read_only_range,
+	.n_no_ranges = ARRAY_SIZE(ads1299_regmap_read_only_range),
+};
+
 static const struct regmap_config ads1299_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.reg_read = ads1299_reg_read,
 	.reg_write = ads1299_reg_write,
 	.max_register = ADS1299_REG_CONFIG4,
+	.wr_table = &ads1299_regmap_writeable,
 	.volatile_table = &ads1299_regmap_volatile,
 	.cache_type = REGCACHE_MAPLE,
 };
@@ -2352,6 +2387,28 @@ static int ads1299_setup_clk_out(struct ads1299_private *priv)
 
 	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get,
 					   &priv->clk_out);
+}
+
+/*
+ * A reset, by the RESET pin when there is one, otherwise by the command: two
+ * tCLK low, then 18 tCLK before the part is used [SBAS499 Figure 76].
+ */
+static int ads1299_reset(struct ads1299_private *priv)
+{
+	int ret;
+
+	if (priv->reset_gpio) {
+		gpiod_set_value_cansleep(priv->reset_gpio, 1);
+		fsleep(ADS1299_CLOCKS_TO_USECS(2));
+		gpiod_set_value_cansleep(priv->reset_gpio, 0);
+	} else {
+		ret = ads1299_write_cmd(priv, ADS1299_CMD_RESET);
+		if (ret)
+			return ret;
+	}
+	fsleep(ADS1299_CLOCKS_TO_USECS(18));
+
+	return 0;
 }
 
 static int ads1299_init(struct iio_dev *indio_dev)
@@ -2742,7 +2799,6 @@ static int ads1299_probe(struct spi_device *spi)
 	struct ads1299_private *priv;
 	struct iio_dev *indio_dev;
 	struct device *dev = &spi->dev;
-	struct gpio_desc *reset_gpio;
 	u32 chain = 1;
 	int ret;
 
@@ -2753,10 +2809,17 @@ static int ads1299_probe(struct spi_device *spi)
 	priv = iio_priv(indio_dev);
 
 	/* Reset to be asserted before enabling clock and power */
-	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
-	if (IS_ERR(reset_gpio))
-		return dev_err_probe(dev, PTR_ERR(reset_gpio),
+	priv->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(priv->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(priv->reset_gpio),
 				     "Cannot get reset GPIO\n");
+
+	/* Out of power-down, if the board can put it there */
+	priv->powerdown_gpio = devm_gpiod_get_optional(dev, "powerdown",
+						       GPIOD_OUT_LOW);
+	if (IS_ERR(priv->powerdown_gpio))
+		return dev_err_probe(dev, PTR_ERR(priv->powerdown_gpio),
+				     "Cannot get powerdown GPIO\n");
 
 	/* VREF can be supplied externally, otherwise use the internal 4.5 V */
 	ret = ads1299_get_optional_supply(dev, "vref", &priv->reg_vref);
@@ -2795,6 +2858,11 @@ static int ads1299_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
+	ret = devm_regulator_get_enable(dev, "dvdd");
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to enable dvdd regulator\n");
+
+	spi_set_drvdata(spi, indio_dev);
 	priv->spi = spi;
 	init_completion(&priv->completion);
 	spin_lock_init(&priv->irq_busy_lock);
@@ -2812,20 +2880,13 @@ static int ads1299_probe(struct spi_device *spi)
 	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_SOFTWARE;
 	indio_dev->info = &ads1299_info;
 
-	if (reset_gpio) {
-		/*
-		 * Deassert reset now that clock and power are active.
-		 * Minimum reset pulsewidth is 2 clock cycles.
-		 */
-		fsleep(ADS1299_CLOCKS_TO_USECS(2));
-		gpiod_set_value_cansleep(reset_gpio, 0);
-	} else {
-		ret = ads1299_write_cmd(priv, ADS1299_CMD_RESET);
-		if (ret)
-			return dev_err_probe(dev, ret, "RESET failed\n");
-	}
-	/* Wait 18 clock cycles for the reset command to complete */
-	fsleep(ADS1299_CLOCKS_TO_USECS(18));
+	/* Just out of power-down: the oscillator and reference wake first */
+	if (priv->powerdown_gpio)
+		msleep(ADS1299_START_UP_MS);
+
+	ret = ads1299_reset(priv);
+	if (ret)
+		return dev_err_probe(dev, ret, "RESET failed\n");
 
 	ret = ads1299_init(indio_dev);
 	if (ret)
@@ -2894,6 +2955,84 @@ static int ads1299_probe(struct spi_device *spi)
 	return devm_iio_device_register(dev, indio_dev);
 }
 
+/*
+ * System sleep. With a PWDN pin the part is powered down, and since the
+ * datasheet does not say what its registers keep there, resume treats them as
+ * lost: start-up time, a reset, SDATAC, and the configuration written back
+ * from the cache. CONFIG3 and GPIO are volatile, kept by the driver and
+ * written back by hand. Without the pin, standby, which keeps the digital
+ * side and its registers. A running buffer is stopped and started again.
+ *
+ * No runtime PM: suspending while idle would drop the bias drive into the
+ * subject and the clock output other converters run from, and every direct
+ * read would pay the reference's start-up.
+ */
+static int ads1299_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int config3;
+	int ret;
+
+	priv->resume_running = iio_buffer_enabled(indio_dev);
+	if (priv->resume_running) {
+		ret = ads1299_stop_conversions(priv);
+		if (ret)
+			return ret;
+	}
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG3, &config3);
+	if (ret)
+		return ret;
+	priv->config3_saved = config3 & ~ADS1299_MASK_CONFIG3_BIAS_STAT;
+
+	if (!priv->powerdown_gpio)
+		return ads1299_write_cmd(priv, ADS1299_CMD_STANDBY);
+
+	gpiod_set_value_cansleep(priv->powerdown_gpio, 1);
+	regcache_mark_dirty(priv->regmap);
+
+	return 0;
+}
+
+static int ads1299_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	int ret;
+
+	if (priv->powerdown_gpio) {
+		gpiod_set_value_cansleep(priv->powerdown_gpio, 0);
+		msleep(ADS1299_START_UP_MS);
+
+		ret = ads1299_reset(priv);
+		if (!ret)
+			ret = ads1299_write_cmd(priv, ADS1299_CMD_SDATAC);
+		if (!ret)
+			ret = regcache_sync(priv->regmap);
+		if (!ret)
+			ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG3,
+					   priv->config3_saved);
+		/* Twice, as direction_output() does: the pins came back inputs */
+		if (!ret) {
+			guard(mutex)(&priv->gpio_lock);
+			ret = ads1299_gpio_write(priv);
+			if (!ret)
+				ret = ads1299_gpio_write(priv);
+		}
+	} else {
+		ret = ads1299_write_cmd(priv, ADS1299_CMD_WAKEUP);
+		fsleep(ADS1299_WAKEUP_USECS + ADS1299_CLOCKS_TO_USECS(4));
+	}
+	if (ret)
+		return ret;
+
+	return priv->resume_running ? ads1299_start_conversions(priv) : 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(ads1299_pm_ops, ads1299_suspend,
+				ads1299_resume);
+
 static const struct spi_device_id ads1299_id[] = {
 	{ "ads1299" },
 	{ "ads1299-4" },
@@ -2914,6 +3053,7 @@ static struct spi_driver ads1299_driver = {
 	.driver = {
 		.name	= "ads1299",
 		.of_match_table = ads1299_of_table,
+		.pm	= pm_sleep_ptr(&ads1299_pm_ops),
 	},
 	.probe		= ads1299_probe,
 	.id_table	= ads1299_id,
