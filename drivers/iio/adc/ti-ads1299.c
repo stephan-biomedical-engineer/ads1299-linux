@@ -924,58 +924,111 @@ static ssize_t bias_drive_available_show(struct device *dev,
 	return len + sysfs_emit_at(buf, len, "\n");
 }
 
+/*
+ * The test generator's settings, by name. INT_CAL = 0 is "driven externally"
+ * in the datasheet, but this part has no external test pin, so it leaves the
+ * test input undriven: "off". CAL_FREQ = 10 is "do not use" and has no name.
+ */
+static const struct {
+	const char *name;
+	u8 config2;
+} ads1299_test_signals[] = {
+	{ "off", 0 },
+	{ "1x_slow", ADS1299_MASK_CONFIG2_INT_CAL |
+		     FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				      ADS1299_CAL_FREQ_SLOW) },
+	{ "1x_fast", ADS1299_MASK_CONFIG2_INT_CAL |
+		     FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				      ADS1299_CAL_FREQ_FAST) },
+	{ "1x_dc", ADS1299_MASK_CONFIG2_INT_CAL |
+		   FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				    ADS1299_CAL_FREQ_DC) },
+	{ "2x_slow", ADS1299_MASK_CONFIG2_INT_CAL |
+		     ADS1299_MASK_CONFIG2_CAL_AMP |
+		     FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				      ADS1299_CAL_FREQ_SLOW) },
+	{ "2x_fast", ADS1299_MASK_CONFIG2_INT_CAL |
+		     ADS1299_MASK_CONFIG2_CAL_AMP |
+		     FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				      ADS1299_CAL_FREQ_FAST) },
+	{ "2x_dc", ADS1299_MASK_CONFIG2_INT_CAL |
+		   ADS1299_MASK_CONFIG2_CAL_AMP |
+		   FIELD_PREP_CONST(ADS1299_MASK_CONFIG2_CAL_FREQ,
+				    ADS1299_CAL_FREQ_DC) },
+};
+
+#define ADS1299_MASK_CONFIG2_TEST					\
+	(ADS1299_MASK_CONFIG2_INT_CAL | ADS1299_MASK_CONFIG2_CAL_AMP |	\
+	 ADS1299_MASK_CONFIG2_CAL_FREQ)
+
 static ssize_t test_signal_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
 	unsigned int regval;
+	unsigned int i;
 	int ret;
 
 	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG2, &regval);
 	if (ret)
 		return ret;
 
+	/* With the generator off, its amplitude and frequency mean nothing */
 	if (!(regval & ADS1299_MASK_CONFIG2_INT_CAL))
 		return sysfs_emit(buf, "off\n");
 
-	return sysfs_emit(buf, "%s_%s\n",
-			  regval & ADS1299_MASK_CONFIG2_CAL_AMP ? "2x" : "1x",
-			  FIELD_GET(ADS1299_MASK_CONFIG2_CAL_FREQ, regval) ==
-				  ADS1299_CAL_FREQ_FAST ? "fast" : "slow");
+	for (i = 0; i < ARRAY_SIZE(ads1299_test_signals); i++)
+		if ((regval & ADS1299_MASK_CONFIG2_TEST) ==
+		    ads1299_test_signals[i].config2)
+			return sysfs_emit(buf, "%s\n",
+					  ads1299_test_signals[i].name);
+
+	/* CAL_FREQ = 10, which only a debugfs register write can set */
+	return -EINVAL;
 }
 
 static ssize_t test_signal_store(struct device *dev,
 				 struct device_attribute *attr,
 				 const char *buf, size_t len)
 {
-	static const char * const options[] = {
-		"off", "1x_slow", "1x_fast", "2x_slow", "2x_fast",
-	};
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
-	unsigned int val = ADS1299_CONFIG2_RESERVED_VALUE;
-	int choice;
+	unsigned int i;
 	int ret;
 
-	choice = sysfs_match_string(options, buf);
-	if (choice < 0)
-		return choice;
+	for (i = 0; i < ARRAY_SIZE(ads1299_test_signals); i++)
+		if (sysfs_streq(buf, ads1299_test_signals[i].name))
+			break;
+	if (i == ARRAY_SIZE(ads1299_test_signals))
+		return -EINVAL;
 
-	if (choice > 0) {
-		val |= ADS1299_MASK_CONFIG2_INT_CAL;
-		if (choice >= 3)
-			val |= ADS1299_MASK_CONFIG2_CAL_AMP;
-		if (choice == 2 || choice == 4)
-			val |= FIELD_PREP(ADS1299_MASK_CONFIG2_CAL_FREQ,
-					  ADS1299_CAL_FREQ_FAST);
-	}
-
-	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2, val);
+	/* Not while running: a test channel's samples would change meaning */
+	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
 
-	return (ssize_t)len;
+	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
+			   ADS1299_CONFIG2_RESERVED_VALUE |
+			   ads1299_test_signals[i].config2);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t test_signal_available_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ads1299_test_signals); i++)
+		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
+				     ads1299_test_signals[i].name);
+
+	return len + sysfs_emit_at(buf, len, "\n");
 }
 
 static ssize_t lead_off_status_show(struct device *dev,
@@ -1041,6 +1094,7 @@ static ssize_t timestamp_source_show(struct device *dev,
 static IIO_DEVICE_ATTR_RW(input_mux, 0);
 static IIO_DEVICE_ATTR_RO(input_mux_available, 0);
 static IIO_DEVICE_ATTR_RW(test_signal, 0);
+static IIO_DEVICE_ATTR_RO(test_signal_available, 0);
 static IIO_DEVICE_ATTR_RW(bias_drive, 0);
 static IIO_DEVICE_ATTR_RO(bias_drive_available, 0);
 static IIO_DEVICE_ATTR_RO(lead_off_status, 0);
@@ -1051,6 +1105,7 @@ static struct attribute *ads1299_attributes[] = {
 	&iio_dev_attr_input_mux.dev_attr.attr,
 	&iio_dev_attr_input_mux_available.dev_attr.attr,
 	&iio_dev_attr_test_signal.dev_attr.attr,
+	&iio_dev_attr_test_signal_available.dev_attr.attr,
 	&iio_dev_attr_bias_drive.dev_attr.attr,
 	&iio_dev_attr_bias_drive_available.dev_attr.attr,
 	&iio_dev_attr_lead_off_status.dev_attr.attr,
