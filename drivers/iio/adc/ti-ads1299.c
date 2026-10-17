@@ -445,6 +445,52 @@ static ssize_t ads1299_loff_channel_write(struct iio_dev *indio_dev,
 	return ret ? ret : (ssize_t)len;
 }
 
+/*
+ * SRB2 [SBAS499 Table 17, Figure 18]: closes a switch between the SRB2 pin
+ * and this channel's positive input.
+ */
+static ssize_t ads1299_srb2_read(struct iio_dev *indio_dev, uintptr_t private,
+				 const struct iio_chan_spec *chan, char *buf)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(chan->channel),
+			  &regval);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(regval & ADS1299_MASK_CH_SRB2));
+}
+
+static ssize_t ads1299_srb2_write(struct iio_dev *indio_dev, uintptr_t private,
+				  const struct iio_chan_spec *chan,
+				  const char *buf, size_t len)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	/* Not while running: the channel would measure another difference */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->regmap,
+				 ADS1299_REG_CHnSET(chan->channel),
+				 ADS1299_MASK_CH_SRB2,
+				 on ? ADS1299_MASK_CH_SRB2 : 0);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
 static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 	{
 		.name = "lead_off_sense_p",
@@ -466,6 +512,12 @@ static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 		.read = ads1299_loff_channel_read,
 		.write = ads1299_loff_channel_write,
 		.private = 2,
+	},
+	{
+		.name = "srb2",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_srb2_read,
+		.write = ads1299_srb2_write,
 	},
 	{ }
 };
@@ -1524,6 +1576,75 @@ static ssize_t ads1299_loff_available_show(struct device *dev,
 	return len + sysfs_emit_at(buf, len, "\n");
 }
 
+/*
+ * SRB1 [SBAS499 Table 26, Figure 18]: closes the switches that tie the SRB1
+ * pin to the negative input of every channel whose MUX is on the electrodes.
+ * Open, each channel is the difference between its own two inputs; closed,
+ * between its positive input and what SRB1 carries, a common reference
+ * electrode. Only the switch: what the bias or the lead-off sensing should
+ * do about it is not decided here.
+ */
+static const char * const ads1299_montage_names[] = {
+	"bipolar", "referential",
+};
+
+static ssize_t montage_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	bool referential;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_MISC1, &regval);
+	if (ret)
+		return ret;
+
+	referential = regval & ADS1299_MASK_MISC1_SRB1;
+
+	return sysfs_emit(buf, "%s\n", ads1299_montage_names[referential]);
+}
+
+static ssize_t montage_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	int referential;
+	int ret;
+
+	referential = sysfs_match_string(ads1299_montage_names, buf);
+	if (referential < 0)
+		return referential;
+
+	/* Not while running: every sample would measure another difference */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->regmap, ADS1299_REG_MISC1,
+				 ADS1299_MASK_MISC1_SRB1,
+				 referential ? ADS1299_MASK_MISC1_SRB1 : 0);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t montage_available_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ads1299_montage_names); i++)
+		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
+				     ads1299_montage_names[i]);
+
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+
 static ssize_t lost_samples_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1553,6 +1674,8 @@ static IIO_DEVICE_ATTR_RO(bias_drive_available, 0);
 static IIO_DEVICE_ATTR_RO(lead_off_status, 0);
 static IIO_DEVICE_ATTR_RW(bias_lead_off, 0);
 static IIO_DEVICE_ATTR_RO(bias_lead_off_status, 0);
+static IIO_DEVICE_ATTR_RW(montage, 0);
+static IIO_DEVICE_ATTR_RO(montage_available, 0);
 static IIO_DEVICE_ATTR(lead_off_threshold_percent, 0644, ads1299_loff_show,
 		       ads1299_loff_store, ADS1299_LOFF_THRESHOLD);
 static IIO_DEVICE_ATTR(lead_off_threshold_percent_available, 0444,
@@ -1578,6 +1701,8 @@ static struct attribute *ads1299_attributes[] = {
 	&iio_dev_attr_lead_off_status.dev_attr.attr,
 	&iio_dev_attr_bias_lead_off.dev_attr.attr,
 	&iio_dev_attr_bias_lead_off_status.dev_attr.attr,
+	&iio_dev_attr_montage.dev_attr.attr,
+	&iio_dev_attr_montage_available.dev_attr.attr,
 	&iio_dev_attr_lead_off_threshold_percent.dev_attr.attr,
 	&iio_dev_attr_lead_off_threshold_percent_available.dev_attr.attr,
 	&iio_dev_attr_lead_off_current_nanoamp.dev_attr.attr,
@@ -2010,6 +2135,11 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	if (ret)
 		return ret;
 
+	/* SRB1 open, written; the rest of MISC1 is reserved and always 0 */
+	ret = regmap_write(priv->regmap, ADS1299_REG_MISC1, 0);
+	if (ret)
+		return ret;
+
 	/* Lead-off at its reset value, written: 95% / 5%, 6 nA, DC */
 	ret = regmap_write(priv->regmap, ADS1299_REG_LOFF,
 			   FIELD_PREP(ADS1299_MASK_LOFF_COMP_TH,
@@ -2057,11 +2187,14 @@ static int ads1299_init(struct iio_dev *indio_dev)
 
 	/*
 	 * CHnSET out of reset is gain 24 with the input SHORTED, which reads as
-	 * a clean, plausible flat trace, so the MUX is programmed explicitly.
+	 * a clean, plausible flat trace, so the MUX is programmed explicitly;
+	 * and SRB2 open, written.
 	 */
 	for (i = 0; i < priv->num_adc_channels; i++) {
 		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(i),
-					 ADS1299_MASK_CH_MUX | ADS1299_MASK_CH_PD,
+					 ADS1299_MASK_CH_MUX |
+					 ADS1299_MASK_CH_PD |
+					 ADS1299_MASK_CH_SRB2,
 					 FIELD_PREP(ADS1299_MASK_CH_MUX,
 						    ADS1299_MUX_NORMAL));
 		if (ret)
