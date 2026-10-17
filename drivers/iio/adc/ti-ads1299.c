@@ -1231,6 +1231,116 @@ static ssize_t bias_lead_off_status_show(struct device *dev,
 				  "disconnected" : "connected");
 }
 
+/*
+ * The LOFF fields [SBAS499 Table 16], by name, indexed by field code, for
+ * every lead-off detection on the part: the channels' and the bias
+ * electrode's. One COMP_TH code sets both comparators; the name is the
+ * positive side's threshold in percent and the negative side's is its
+ * complement, so 95 is 95% / 5%. The current is in nanoamperes. The AC
+ * frequencies are in hertz from the 2.048 MHz internal clock, and an external
+ * clock scales them.
+ */
+static const char * const ads1299_loff_threshold_names[] = {
+	"95", "92.5", "90", "87.5", "85", "80", "75", "70",
+};
+
+static const char * const ads1299_loff_current_names[] = {
+	"6", "24", "6000", "24000",
+};
+
+static const char * const ads1299_loff_frequency_names[] = {
+	"dc", "ac_7.8", "ac_31.2", "ac_fdr_div_4",
+};
+
+enum ads1299_loff_field {
+	ADS1299_LOFF_THRESHOLD,
+	ADS1299_LOFF_CURRENT,
+	ADS1299_LOFF_FREQUENCY,
+};
+
+static const struct {
+	u8 mask;
+	const char * const *names;
+	unsigned int count;
+} ads1299_loff_fields[] = {
+	[ADS1299_LOFF_THRESHOLD] = {
+		ADS1299_MASK_LOFF_COMP_TH, ads1299_loff_threshold_names,
+		ARRAY_SIZE(ads1299_loff_threshold_names),
+	},
+	[ADS1299_LOFF_CURRENT] = {
+		ADS1299_MASK_LOFF_ILEAD_OFF, ads1299_loff_current_names,
+		ARRAY_SIZE(ads1299_loff_current_names),
+	},
+	[ADS1299_LOFF_FREQUENCY] = {
+		ADS1299_MASK_LOFF_FLEAD_OFF, ads1299_loff_frequency_names,
+		ARRAY_SIZE(ads1299_loff_frequency_names),
+	},
+};
+
+static ssize_t ads1299_loff_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int field = to_iio_dev_attr(attr)->address;
+	u8 mask = ads1299_loff_fields[field].mask;
+	unsigned int regval;
+	unsigned int code;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF, &regval);
+	if (ret)
+		return ret;
+
+	code = (regval & mask) >> __ffs(mask);
+
+	return sysfs_emit(buf, "%s\n", ads1299_loff_fields[field].names[code]);
+}
+
+static ssize_t ads1299_loff_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int field = to_iio_dev_attr(attr)->address;
+	u8 mask = ads1299_loff_fields[field].mask;
+	int code;
+	int ret;
+
+	code = __sysfs_match_string(ads1299_loff_fields[field].names,
+				    ads1299_loff_fields[field].count, buf);
+	if (code < 0)
+		return code;
+
+	/* Not while running: current and thresholds change what is measured */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->regmap, ADS1299_REG_LOFF, mask,
+				 ((unsigned int)code << __ffs(mask)) & mask);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t ads1299_loff_available_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	unsigned int field = to_iio_dev_attr(attr)->address;
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < ads1299_loff_fields[field].count; i++)
+		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
+				     ads1299_loff_fields[field].names[i]);
+
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+
 static ssize_t lost_samples_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1260,6 +1370,18 @@ static IIO_DEVICE_ATTR_RO(bias_drive_available, 0);
 static IIO_DEVICE_ATTR_RO(lead_off_status, 0);
 static IIO_DEVICE_ATTR_RW(bias_lead_off, 0);
 static IIO_DEVICE_ATTR_RO(bias_lead_off_status, 0);
+static IIO_DEVICE_ATTR(lead_off_threshold_percent, 0644, ads1299_loff_show,
+		       ads1299_loff_store, ADS1299_LOFF_THRESHOLD);
+static IIO_DEVICE_ATTR(lead_off_threshold_percent_available, 0444,
+		       ads1299_loff_available_show, NULL, ADS1299_LOFF_THRESHOLD);
+static IIO_DEVICE_ATTR(lead_off_current_nanoamp, 0644, ads1299_loff_show,
+		       ads1299_loff_store, ADS1299_LOFF_CURRENT);
+static IIO_DEVICE_ATTR(lead_off_current_nanoamp_available, 0444,
+		       ads1299_loff_available_show, NULL, ADS1299_LOFF_CURRENT);
+static IIO_DEVICE_ATTR(lead_off_frequency, 0644, ads1299_loff_show,
+		       ads1299_loff_store, ADS1299_LOFF_FREQUENCY);
+static IIO_DEVICE_ATTR(lead_off_frequency_available, 0444,
+		       ads1299_loff_available_show, NULL, ADS1299_LOFF_FREQUENCY);
 static IIO_DEVICE_ATTR_RO(lost_samples, 0);
 static IIO_DEVICE_ATTR_RO(timestamp_source, 0);
 
@@ -1273,6 +1395,12 @@ static struct attribute *ads1299_attributes[] = {
 	&iio_dev_attr_lead_off_status.dev_attr.attr,
 	&iio_dev_attr_bias_lead_off.dev_attr.attr,
 	&iio_dev_attr_bias_lead_off_status.dev_attr.attr,
+	&iio_dev_attr_lead_off_threshold_percent.dev_attr.attr,
+	&iio_dev_attr_lead_off_threshold_percent_available.dev_attr.attr,
+	&iio_dev_attr_lead_off_current_nanoamp.dev_attr.attr,
+	&iio_dev_attr_lead_off_current_nanoamp_available.dev_attr.attr,
+	&iio_dev_attr_lead_off_frequency.dev_attr.attr,
+	&iio_dev_attr_lead_off_frequency_available.dev_attr.attr,
 	&iio_dev_attr_lost_samples.dev_attr.attr,
 	&iio_dev_attr_timestamp_source.dev_attr.attr,
 	NULL
@@ -1609,6 +1737,17 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
 				 ADS1299_MASK_CONFIG1_DAISY_EN |
 				 ADS1299_MASK_CONFIG1_CLK_EN, 0);
+	if (ret)
+		return ret;
+
+	/* Lead-off at its reset value, written: 95% / 5%, 6 nA, DC */
+	ret = regmap_write(priv->regmap, ADS1299_REG_LOFF,
+			   FIELD_PREP(ADS1299_MASK_LOFF_COMP_TH,
+				      ADS1299_LOFF_COMP_TH_95_5) |
+			   FIELD_PREP(ADS1299_MASK_LOFF_ILEAD_OFF,
+				      ADS1299_LOFF_ILEAD_OFF_6NA) |
+			   FIELD_PREP(ADS1299_MASK_LOFF_FLEAD_OFF,
+				      ADS1299_LOFF_FLEAD_OFF_DC));
 	if (ret)
 		return ret;
 
