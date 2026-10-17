@@ -92,6 +92,11 @@ properties:
       External voltage reference on VREFP. Omit to use the internal 4.5 V
       reference.
 
+  biasref-supply:
+    description:
+      External voltage on the BIASREF pin, the reference of the bias drive
+      amplifier. Omit to have the part generate (AVDD + AVSS) / 2.
+
   spi-cpha: true
 
 required:
