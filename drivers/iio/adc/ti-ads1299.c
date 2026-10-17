@@ -19,6 +19,7 @@
  *    registered
  *  - input MUX, test signal and bias drive controls, and the lead-off status
  *  - the CLK pin as a clock output, for other converters to run from
+ *  - GPIO1 to GPIO4 as a gpiochip, when the board wires them
  */
 
 #include <linux/bitfield.h>
@@ -29,11 +30,13 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/hrtimer.h>
 #include <linux/log2.h>
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
@@ -266,6 +269,14 @@ struct ads1299_private {
 	struct regulator *reg_biasref;
 	struct clk *clk;
 	struct clk_hw clk_out;
+	struct gpio_chip gpio;
+	/*
+	 * What the GPIO register was last written with: GPIOC and the output
+	 * levels. Writes are built from it and not read back, because a read
+	 * of GPIOD returns the pins and not the levels written to them.
+	 */
+	struct mutex gpio_lock;	/* protects gpio_shadow */
+	u8 gpio_shadow;
 	struct regmap *regmap;
 	struct completion completion;
 	struct spi_transfer rdata_xfer;
@@ -1996,10 +2007,14 @@ static int ads1299_get_optional_supply(struct device *dev, const char *id,
 	return devm_add_action_or_reset(dev, ads1299_reg_disable, *reg);
 }
 
-/* CONFIG3 for BIAS_STAT, its one status bit; a write cannot set it */
+/*
+ * CONFIG3 for BIAS_STAT, its one status bit; GPIO because its data bits read
+ * the pins, which nothing in the cache can know.
+ */
 static const struct regmap_range ads1299_regmap_volatile_range[] = {
 	regmap_reg_range(ADS1299_REG_CONFIG3, ADS1299_REG_CONFIG3),
 	regmap_reg_range(ADS1299_REG_LOFF_STATP, ADS1299_REG_LOFF_STATN),
+	regmap_reg_range(ADS1299_REG_GPIO, ADS1299_REG_GPIO),
 };
 
 static const struct regmap_access_table ads1299_regmap_volatile = {
@@ -2070,6 +2085,125 @@ static const struct clk_ops ads1299_clk_out_ops = {
  * Registered only when the node is a clock provider. With an external clock
  * the CLKSEL pin is low and CLK is an input, so there is nothing to drive.
  */
+/*
+ * GPIO1 to GPIO4 [SBAS499 9.3.2.3, Table 25]. GPIOC bit n is pin n + 1's
+ * direction, 1 an input; GPIOD bit n is its level. A read of GPIOD returns
+ * the pins, whether inputs or outputs, so it is never written back: a
+ * read-modify-write would copy an output pulled away from its level into the
+ * level of another. Writes come from gpio_shadow; only get() reads the part.
+ */
+#define ADS1299_NUM_GPIOS		4
+
+static int ads1299_gpio_write(struct ads1299_private *priv)
+{
+	return regmap_write(priv->regmap, ADS1299_REG_GPIO, priv->gpio_shadow);
+}
+
+static int ads1299_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
+{
+	struct ads1299_private *priv = gpiochip_get_data(gc);
+
+	guard(mutex)(&priv->gpio_lock);
+
+	return priv->gpio_shadow & BIT(offset) ? GPIO_LINE_DIRECTION_IN :
+						 GPIO_LINE_DIRECTION_OUT;
+}
+
+static int ads1299_gpio_direction_input(struct gpio_chip *gc,
+					unsigned int offset)
+{
+	struct ads1299_private *priv = gpiochip_get_data(gc);
+
+	guard(mutex)(&priv->gpio_lock);
+
+	priv->gpio_shadow |= BIT(offset);
+
+	return ads1299_gpio_write(priv);
+}
+
+static void ads1299_gpio_set_level(struct ads1299_private *priv,
+				   unsigned int offset, int value)
+{
+	if (value)
+		priv->gpio_shadow |= BIT(offset + ADS1299_NUM_GPIOS);
+	else
+		priv->gpio_shadow &= ~BIT(offset + ADS1299_NUM_GPIOS);
+}
+
+static int ads1299_gpio_get(struct gpio_chip *gc, unsigned int offset)
+{
+	struct ads1299_private *priv = gpiochip_get_data(gc);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_GPIO, &regval);
+	if (ret)
+		return ret;
+
+	return !!(regval & BIT(offset + ADS1299_NUM_GPIOS));
+}
+
+static void ads1299_gpio_set(struct gpio_chip *gc, unsigned int offset,
+			     int value)
+{
+	struct ads1299_private *priv = gpiochip_get_data(gc);
+
+	guard(mutex)(&priv->gpio_lock);
+
+	ads1299_gpio_set_level(priv, offset, value);
+	ads1299_gpio_write(priv);
+}
+
+/*
+ * The datasheet does not say whether the write that makes a pin an output
+ * also latches its level, so the register is written once with both and once
+ * more with the pin already an output.
+ */
+static int ads1299_gpio_direction_output(struct gpio_chip *gc,
+					 unsigned int offset, int value)
+{
+	struct ads1299_private *priv = gpiochip_get_data(gc);
+	int ret;
+
+	guard(mutex)(&priv->gpio_lock);
+
+	ads1299_gpio_set_level(priv, offset, value);
+	priv->gpio_shadow &= ~BIT(offset);
+
+	ret = ads1299_gpio_write(priv);
+	if (ret)
+		return ret;
+
+	return ads1299_gpio_write(priv);
+}
+
+/*
+ * Registered only when the board says the pins are wired: the datasheet asks
+ * for unused ones to be tied to DGND, and a gpiochip over those would let an
+ * output be driven into ground.
+ */
+static int ads1299_setup_gpio(struct ads1299_private *priv)
+{
+	struct device *dev = &priv->spi->dev;
+
+	if (!device_property_present(dev, "gpio-controller"))
+		return 0;
+
+	priv->gpio.label = dev_name(dev);
+	priv->gpio.parent = dev;
+	priv->gpio.owner = THIS_MODULE;
+	priv->gpio.base = -1;
+	priv->gpio.ngpio = ADS1299_NUM_GPIOS;
+	priv->gpio.can_sleep = true;
+	priv->gpio.get_direction = ads1299_gpio_get_direction;
+	priv->gpio.direction_input = ads1299_gpio_direction_input;
+	priv->gpio.direction_output = ads1299_gpio_direction_output;
+	priv->gpio.get = ads1299_gpio_get;
+	priv->gpio.set = ads1299_gpio_set;
+
+	return devm_gpiochip_add_data(dev, &priv->gpio, priv);
+}
+
 static int ads1299_setup_clk_out(struct ads1299_private *priv)
 {
 	struct device *dev = &priv->spi->dev;
@@ -2139,6 +2273,15 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
 				 ADS1299_MASK_CONFIG1_DAISY_EN |
 				 ADS1299_MASK_CONFIG1_CLK_EN, 0);
+	if (ret)
+		return ret;
+
+	/* Every GPIO an input, as after reset, written */
+	ret = devm_mutex_init(dev, &priv->gpio_lock);
+	if (ret)
+		return ret;
+	priv->gpio_shadow = ADS1299_MASK_GPIO_CONTROL;
+	ret = ads1299_gpio_write(priv);
 	if (ret)
 		return ret;
 
@@ -2592,6 +2735,10 @@ static int ads1299_probe(struct spi_device *spi)
 
 	/* A part that failed is not a clock source for others either */
 	ret = ads1299_setup_clk_out(priv);
+	if (ret)
+		return ret;
+
+	ret = ads1299_setup_gpio(priv);
 	if (ret)
 		return ret;
 
