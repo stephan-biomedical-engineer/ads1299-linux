@@ -199,23 +199,12 @@
 #define ADS1299_MASK_CONFIG4_PD_LOFF_COMP	BIT(1)
 
 /*
- * Bias amplifier mode:
- *   off       - powered down, the reset state
- *   reference - drives BIASREF, (AVDD + AVSS) / 2: a DC bias, no feedback
- *   derived   - drives the inverted average of the electrodes' inputs, which
- *               is what rejects common mode
+ * The bias drive amplifier, on or off (PD_BIAS). What it drives follows from
+ * the per-channel bias_sense_p and bias_sense_n: the inverted average of the
+ * inputs selected, which is what rejects common mode, or with none selected
+ * just BIASREF, a DC bias with no feedback.
  */
-enum ads1299_bias {
-	ADS1299_BIAS_OFF,
-	ADS1299_BIAS_REFERENCE,
-	ADS1299_BIAS_DERIVED,
-};
-
-static const char * const ads1299_bias_names[] = {
-	[ADS1299_BIAS_OFF]	 = "off",
-	[ADS1299_BIAS_REFERENCE] = "reference",
-	[ADS1299_BIAS_DERIVED]	 = "derived",
-};
+static const char * const ads1299_bias_names[] = { "off", "on" };
 
 #define ADS1299_MAX_CHANNELS			8
 #define ADS1299_BITS_PER_SAMPLE			24
@@ -297,7 +286,6 @@ struct ads1299_private {
 
 	/* Number of ADC channels the chip reported; excludes the timestamp */
 	unsigned int num_adc_channels;
-	enum ads1299_bias bias;
 	/*
 	 * What lead-off is read with at each conversion, kept here for the SPI
 	 * completion, which runs where the regmap's lock cannot be taken: the
@@ -387,26 +375,32 @@ static int ads1299_cache_loff(struct ads1299_private *priv)
 }
 
 /*
- * Lead-off per channel [SBAS499 9.3.2.4.3]: sensing on the positive input,
- * on the negative input, and the flip that swaps which of the two the current
- * pulls to AVDD and which to AVSS. One bit per channel in each register.
+ * The registers with one bit per channel, each a per-channel boolean:
+ *  - lead-off [SBAS499 9.3.2.4.3]: sensing on the positive input, on the
+ *    negative input, and the flip that swaps which of the two the current
+ *    pulls to AVDD and which to AVSS;
+ *  - the bias derivation [SBAS499 Tables 18, 19]: whether the positive and
+ *    the negative input are among those averaged into what the bias drive
+ *    amplifier drives back out.
  */
-static const unsigned int ads1299_loff_channel_regs[] = {
+static const unsigned int ads1299_channel_bit_regs[] = {
 	ADS1299_REG_LOFF_SENSP,
 	ADS1299_REG_LOFF_SENSN,
 	ADS1299_REG_LOFF_FLIP,
+	ADS1299_REG_BIAS_SENSP,
+	ADS1299_REG_BIAS_SENSN,
 };
 
-static ssize_t ads1299_loff_channel_read(struct iio_dev *indio_dev,
-					 uintptr_t private,
-					 const struct iio_chan_spec *chan,
-					 char *buf)
+static ssize_t ads1299_channel_bit_read(struct iio_dev *indio_dev,
+					uintptr_t private,
+					const struct iio_chan_spec *chan,
+					char *buf)
 {
 	struct ads1299_private *priv = iio_priv(indio_dev);
 	unsigned int regval;
 	int ret;
 
-	ret = regmap_read(priv->regmap, ads1299_loff_channel_regs[private],
+	ret = regmap_read(priv->regmap, ads1299_channel_bit_regs[private],
 			  &regval);
 	if (ret)
 		return ret;
@@ -414,13 +408,15 @@ static ssize_t ads1299_loff_channel_read(struct iio_dev *indio_dev,
 	return sysfs_emit(buf, "%d\n", !!(regval & BIT(chan->channel)));
 }
 
-static ssize_t ads1299_loff_channel_write(struct iio_dev *indio_dev,
-					  uintptr_t private,
-					  const struct iio_chan_spec *chan,
-					  const char *buf, size_t len)
+static ssize_t ads1299_channel_bit_write(struct iio_dev *indio_dev,
+					 uintptr_t private,
+					 const struct iio_chan_spec *chan,
+					 const char *buf, size_t len)
 {
 	struct ads1299_private *priv = iio_priv(indio_dev);
-	unsigned int reg = ads1299_loff_channel_regs[private];
+	unsigned int reg = ads1299_channel_bit_regs[private];
+	bool sense = reg == ADS1299_REG_LOFF_SENSP ||
+		     reg == ADS1299_REG_LOFF_SENSN;
 	bool on;
 	int ret;
 
@@ -428,16 +424,19 @@ static ssize_t ads1299_loff_channel_write(struct iio_dev *indio_dev,
 	if (ret)
 		return ret;
 
-	/* Not while running: the lead-off current changes what is measured */
+	/*
+	 * Not while running: the lead-off current, or what the bias drives into
+	 * the subject, changes what is measured.
+	 */
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
 
 	ret = regmap_update_bits(priv->regmap, reg, BIT(chan->channel),
 				 on ? BIT(chan->channel) : 0);
-	if (!ret && reg != ADS1299_REG_LOFF_FLIP)
+	if (!ret && sense)
 		ret = ads1299_update_loff_comparators(priv);
-	if (!ret)
+	if (!ret && sense)
 		ret = ads1299_cache_loff(priv);
 
 	iio_device_release_direct_mode(indio_dev);
@@ -495,23 +494,37 @@ static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 	{
 		.name = "lead_off_sense_p",
 		.shared = IIO_SEPARATE,
-		.read = ads1299_loff_channel_read,
-		.write = ads1299_loff_channel_write,
+		.read = ads1299_channel_bit_read,
+		.write = ads1299_channel_bit_write,
 		.private = 0,
 	},
 	{
 		.name = "lead_off_sense_n",
 		.shared = IIO_SEPARATE,
-		.read = ads1299_loff_channel_read,
-		.write = ads1299_loff_channel_write,
+		.read = ads1299_channel_bit_read,
+		.write = ads1299_channel_bit_write,
 		.private = 1,
 	},
 	{
 		.name = "lead_off_flip",
 		.shared = IIO_SEPARATE,
-		.read = ads1299_loff_channel_read,
-		.write = ads1299_loff_channel_write,
+		.read = ads1299_channel_bit_read,
+		.write = ads1299_channel_bit_write,
 		.private = 2,
+	},
+	{
+		.name = "bias_sense_p",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_channel_bit_read,
+		.write = ads1299_channel_bit_write,
+		.private = 3,
+	},
+	{
+		.name = "bias_sense_n",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_channel_bit_read,
+		.write = ads1299_channel_bit_write,
+		.private = 4,
 	},
 	{
 		.name = "srb2",
@@ -1112,60 +1125,23 @@ static ssize_t input_mux_available_show(struct device *dev,
 }
 
 /*
- * Program the bias amplifier. Caller holds nothing; regmap serialises the
- * register access and the three writes are not required to be atomic with
- * respect to each other, because the derivation registers only matter while
- * PD_BIAS is set and that bit is written last on the way up and first on the
- * way down.
- *
- * BIASREF_INT travels with the bias and not with the ADC reference. It used to
- * be written at probe alongside PWR_REFBUF, conditioned on whether an external
- * reference regulator exists - which conflated two different references: bit 7
- * is the ADC's reference buffer and bit 3 is the bias amplifier's reference.
- * An external VREF says nothing about how BIASREF is fed. With the amplifier
- * powered down the bit had no effect, so nothing was wrong on any board; it
- * would have become wrong here.
+ * Power the bias amplifier up or down. BIASREF_INT travels with it and not
+ * with the ADC reference: bit 7 of CONFIG3 is the ADC's reference buffer and
+ * bit 3 the bias amplifier's reference, and an external VREF says nothing
+ * about how BIASREF is fed. BIASREF comes from (AVDD + AVSS) / 2 unless the
+ * board feeds the pin.
  */
-static int ads1299_set_bias(struct ads1299_private *priv,
-			    enum ads1299_bias mode)
+static int ads1299_set_bias(struct ads1299_private *priv, bool on)
 {
-	unsigned int derivation = 0;
 	unsigned int config3 = 0;
-	int ret;
 
-	if (mode == ADS1299_BIAS_DERIVED)
-		derivation = GENMASK(priv->num_adc_channels - 1, 0);
-	/* BIASREF from (AVDD + AVSS) / 2 unless the board feeds the pin */
-	if (mode != ADS1299_BIAS_OFF)
+	if (on)
 		config3 = ADS1299_MASK_CONFIG3_PD_BIAS |
 			  (priv->reg_biasref ? 0 : ADS1299_MASK_CONFIG3_BIASREF_INT);
 
-	if (mode == ADS1299_BIAS_OFF) {
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
-					 ADS1299_MASK_CONFIG3_BIASREF_INT |
-					 ADS1299_MASK_CONFIG3_PD_BIAS, 0);
-		if (ret)
-			return ret;
-	}
-
-	ret = regmap_write(priv->regmap, ADS1299_REG_BIAS_SENSP, derivation);
-	if (ret)
-		return ret;
-	ret = regmap_write(priv->regmap, ADS1299_REG_BIAS_SENSN, derivation);
-	if (ret)
-		return ret;
-
-	if (mode != ADS1299_BIAS_OFF) {
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
-					 ADS1299_MASK_CONFIG3_BIASREF_INT |
-					 ADS1299_MASK_CONFIG3_PD_BIAS, config3);
-		if (ret)
-			return ret;
-	}
-
-	priv->bias = mode;
-
-	return 0;
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+				  ADS1299_MASK_CONFIG3_BIASREF_INT |
+				  ADS1299_MASK_CONFIG3_PD_BIAS, config3);
 }
 
 static ssize_t bias_drive_show(struct device *dev,
@@ -1173,8 +1149,17 @@ static ssize_t bias_drive_show(struct device *dev,
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	bool on;
+	int ret;
 
-	return sysfs_emit(buf, "%s\n", ads1299_bias_names[priv->bias]);
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG3, &regval);
+	if (ret)
+		return ret;
+
+	on = regval & ADS1299_MASK_CONFIG3_PD_BIAS;
+
+	return sysfs_emit(buf, "%s\n", ads1299_bias_names[on]);
 }
 
 static ssize_t bias_drive_store(struct device *dev,
@@ -1183,19 +1168,19 @@ static ssize_t bias_drive_store(struct device *dev,
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
-	int mode;
+	int on;
 	int ret;
 
-	mode = sysfs_match_string(ads1299_bias_names, buf);
-	if (mode < 0)
-		return mode;
+	on = sysfs_match_string(ads1299_bias_names, buf);
+	if (on < 0)
+		return on;
 
 	/* Not while running: the samples would change meaning mid-stream */
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
 
-	ret = ads1299_set_bias(priv, mode);
+	ret = ads1299_set_bias(priv, on);
 
 	iio_device_release_direct_mode(indio_dev);
 
@@ -2176,12 +2161,11 @@ static int ads1299_init(struct iio_dev *indio_dev)
 		return ret;
 
 	/*
-	 * Bias off, written rather than assumed. It is the reset state and the
-	 * register write above already cleared PD_BIAS, but the derivation
-	 * registers are not touched by that write and a part that was left
-	 * configured by something else would keep them.
+	 * Bias off: the CONFIG3 write above already cleared PD_BIAS, written
+	 * again so the bias has one way in. Its derivation is cleared below,
+	 * with the other per-channel bits.
 	 */
-	ret = ads1299_set_bias(priv, ADS1299_BIAS_OFF);
+	ret = ads1299_set_bias(priv, false);
 	if (ret)
 		return ret;
 
@@ -2202,12 +2186,13 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	}
 
 	/*
-	 * No input sensed and no flip, written; with nothing sensed the
-	 * comparators go off, so no status says an electrode was watched.
+	 * No input sensed, no flip and no bias derivation, written; with
+	 * nothing sensed the comparators go off, so no status says an electrode
+	 * was watched.
 	 */
-	for (i = 0; i < ARRAY_SIZE(ads1299_loff_channel_regs); i++) {
+	for (i = 0; i < ARRAY_SIZE(ads1299_channel_bit_regs); i++) {
 		ret = regmap_write(priv->regmap,
-				   ads1299_loff_channel_regs[i], 0);
+				   ads1299_channel_bit_regs[i], 0);
 		if (ret)
 			return ret;
 	}
