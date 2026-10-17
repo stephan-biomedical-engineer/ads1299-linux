@@ -1,0 +1,249 @@
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_input_mux
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		What channel Y is connected to, the MUX field of its CHnSET
+		register. One of the values in in_voltage_input_mux_available:
+
+		  * "normal"           - the channel's electrode inputs.
+		  * "shorted"          - both inputs tied together, for an
+		    offset or noise measurement.
+		  * "bias_measurement" - the BIASIN pin; the driver sets
+		    BIAS_MEAS while any channel is here.
+		  * "supply"           - a supply of the part (see
+		    in_voltage_mvdd_analog_raw).
+		  * "temperature"      - the internal temperature sensor.
+		  * "test_signal"      - the internal test generator. Refused
+		    with -EINVAL while test_signal is "off": the part has no
+		    external test pin, so the input would read a node that
+		    nothing drives.
+		  * "bias_drive_p", "bias_drive_n" - the bias drive routed out
+		    through the positive or the negative electrode.
+
+		A write is refused with -EBUSY while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltage_input_mux_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The values in_voltageY_input_mux accepts, the same for every
+		channel.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_srb2
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		1 closes the switch between the SRB2 pin and channel Y's
+		positive input, 0 opens it. A write is refused with -EBUSY
+		while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/montage
+What:		/sys/bus/iio/devices/iio:deviceX/montage_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The SRB1 switches, which tie the SRB1 pin to the negative input
+		of every channel whose input_mux is "normal", "bias_drive_p" or
+		"bias_drive_n":
+
+		  * "bipolar"     - open: each channel measures between its own
+		    two electrodes.
+		  * "referential" - closed: each channel measures its positive
+		    electrode against what SRB1 carries, usually one common
+		    reference electrode.
+
+		Only the switches change; the bias derivation and the lead-off
+		sensing are left as they are. A write is refused with -EBUSY
+		while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/test_signal
+What:		/sys/bus/iio/devices/iio:deviceX/test_signal_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The internal test generator, which reaches a channel whose
+		input_mux is "test_signal":
+
+		  * "off"                          - the generator is off.
+		  * "1x_slow", "1x_fast", "1x_dc"  - an amplitude of
+		    (VREFP - VREFN) / 2400, as a square wave at fCLK / 2^21 or
+		    fCLK / 2^20, or held at DC.
+		  * "2x_slow", "2x_fast", "2x_dc"  - twice that amplitude.
+
+		"off" is refused with -EINVAL while any channel is on the test
+		input. A write is refused with -EBUSY while the buffer is
+		enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/bias_drive
+What:		/sys/bus/iio/devices/iio:deviceX/bias_drive_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		"on" powers the bias drive amplifier, "off" powers it down.
+		What it drives follows from in_voltageY_bias_sense_p and
+		in_voltageY_bias_sense_n: the inverted average of the inputs
+		selected, or with none selected just BIASREF, which is
+		(AVDD + AVSS) / 2 unless the board feeds the BIASREF pin. A
+		write is refused with -EBUSY while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_bias_sense_p
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_bias_sense_n
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		1 adds channel Y's positive (sense_p) or negative (sense_n)
+		input to the inputs averaged into the bias drive, 0 takes it
+		out. Selecting inputs does not power the amplifier, nor does
+		powering it select any. A write is refused with -EBUSY while
+		the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_lead_off_sense_p
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_lead_off_sense_n
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		1 turns lead-off detection on for channel Y's positive
+		(sense_p) or negative (sense_n) input, 0 turns it off. The
+		lead-off comparators are powered while any input, or the bias
+		electrode, is sensed. A write is refused with -EBUSY while the
+		buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltageY_lead_off_flip
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		0 pulls channel Y's positive input to AVDD and its negative
+		input to AVSS for lead-off detection, 1 swaps the two. A write
+		is refused with -EBUSY while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_threshold_percent
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_threshold_percent_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The lead-off comparator thresholds, as the positive side's
+		threshold in percent of the supply; the negative side's is its
+		complement, so "95" is 95% and 5%. One of "95", "92.5", "90",
+		"87.5", "85", "80", "75", "70". It applies to every lead-off
+		detection on the part. A write is refused with -EBUSY while the
+		buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_current_nanoamp
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_current_nanoamp_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The lead-off excitation current in nanoamperes: "6", "24",
+		"6000" or "24000". It applies to every lead-off detection on
+		the part. A write is refused with -EBUSY while the buffer is
+		enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_frequency
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_frequency_available
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The lead-off excitation:
+
+		  * "dc"           - DC; the comparators report the state.
+		  * "ac_7.8", "ac_31.2" - AC at about 7.8 Hz or 31.2 Hz, from
+		    the 2.048 MHz internal clock (fCLK / 2^18 and fCLK / 2^16;
+		    an external clock scales them).
+		  * "ac_fdr_div_4" - AC at a quarter of the data rate.
+
+		With AC excitation the electrode is seen in the data, as the
+		amplitude at the excitation frequency; the comparators do not
+		report it, so lead_off_status reads "ac", the lead-off scan
+		element reads 0 and no lead-off event is raised. A write is
+		refused with -EBUSY while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lead_off_status
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The lead-off comparators' state, read from the part:
+
+		  * "disabled" - no input is sensed.
+		  * "ac"       - the excitation is AC (see lead_off_frequency).
+		  * two hexadecimal bytes, positive inputs then negative, as
+		    "PP NN" - bit n set when channel n + 1's input is off. Only
+		    sensed inputs are reported; the others read 0.
+
+What:		/sys/bus/iio/devices/iio:deviceX/scan_elements/in_voltageX_lead_off_en
+What:		/sys/bus/iio/devices/iio:deviceX/scan_elements/in_voltageX_lead_off_index
+What:		/sys/bus/iio/devices/iio:deviceX/scan_elements/in_voltageX_lead_off_type
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		A scan element after the voltage channels that carries each
+		conversion's lead-off state: an unsigned 16-bit value,
+		(positive << 8) | negative, bit n of each byte set when
+		channel n + 1's input is off. Only sensed inputs are reported,
+		and the value is 0 with AC excitation. It has no _raw and no
+		_scale: it is not a voltage.
+
+What:		/sys/bus/iio/devices/iio:deviceX/events/fault_openwire_en
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		1 raises an IIO_EV_TYPE_FAULT / IIO_EV_DIR_FAULT_OPENWIRE event
+		on in_voltageY when one of channel Y's sensed inputs comes off,
+		once per transition, with the timestamp of the conversion that
+		showed it. Events come from the status word of each conversion,
+		so only while the buffer is enabled, and never with AC
+		excitation. 0, the default, raises none.
+
+What:		/sys/bus/iio/devices/iio:deviceX/bias_lead_off
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		"on" turns lead-off detection on for the bias electrode, and
+		the lead-off comparators with it; "off" turns it off. With the
+		bias drive off the lead-off current goes into the electrode;
+		with it on, the comparator watches the amplifier's output
+		against the lead_off_threshold_percent thresholds. A write is
+		refused with -EBUSY while the buffer is enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/bias_lead_off_status
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The bias electrode's lead-off state, read from the part:
+		"disabled" while bias_lead_off is "off", otherwise "connected"
+		or "disconnected".
+
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltage_mvdd_analog_raw
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltage_mvdd_analog_scale
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltage_mvdd_digital_raw
+What:		/sys/bus/iio/devices/iio:deviceX/in_voltage_mvdd_digital_scale
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		The voltage a channel reads with its input_mux at "supply",
+		taken on channel 1 (analog) and channel 3 (digital) at gain 1
+		and with the channel put back as it was. raw * scale is in
+		millivolts. The datasheet gives it as 0.5 x (AVDD + AVSS) on
+		channels 1, 2 and 5 to 8 and as DVDD / 4 on channels 3 and 4;
+		the voltage measured is reported and no supply is inferred
+		from it. A read is refused with -EBUSY while the buffer is
+		enabled.
+
+What:		/sys/bus/iio/devices/iio:deviceX/lost_samples
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		Conversions the host did not collect since the buffer was last
+		enabled: each one that became due while the read of an earlier
+		one was still in flight, past the one that read then catches.
+
+What:		/sys/bus/iio/devices/iio:deviceX/timestamp_source
+KernelVersion:	6.6
+Contact:	linux-iio@vger.kernel.org
+Description:
+		Where the timestamp of each buffered conversion comes from:
+
+		  * "drdy_irq"   - the DRDY interrupt; the timestamp is taken
+		    one SPI transfer after the conversion.
+		  * "host_timer" - a host timer, when DRDY cannot reach the host
+		    as an interrupt; the timestamp is the host's request, one
+		    bus round trip after the conversion.
