@@ -1179,20 +1179,29 @@ static int ads1299_write_raw(struct iio_dev *indio_dev,
 	struct ads1299_private *priv = iio_priv(indio_dev);
 	int ret;
 
+	/*
+	 * Not while running: the rate or a channel's scale would change in the
+	 * middle of a stream, with nothing in it to say where.
+	 */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		return ads1299_set_samp_freq(priv, val);
+		ret = ads1299_set_samp_freq(priv, val);
+		break;
 	case IIO_CHAN_INFO_HARDWAREGAIN:
-		/* Not while running: the channel's scale would change */
-		ret = iio_device_claim_direct_mode(indio_dev);
-		if (ret)
-			return ret;
 		ret = ads1299_set_gain(priv, chan->channel, val);
-		iio_device_release_direct_mode(indio_dev);
-		return ret;
+		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	}
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret;
 }
 
 static int ads1299_reg_write(void *context, unsigned int reg, unsigned int val)
