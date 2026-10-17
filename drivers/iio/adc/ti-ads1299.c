@@ -556,13 +556,14 @@ static const struct iio_event_spec ads1299_events[] = {
 	.address = ADS1299_OFFSET_IN_RX_BUFFER(index),	\
 	.info_mask_separate =				\
 		BIT(IIO_CHAN_INFO_RAW) |		\
-		BIT(IIO_CHAN_INFO_SCALE),		\
+		BIT(IIO_CHAN_INFO_SCALE) |		\
+		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
+	.info_mask_separate_available =			\
+		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
 	.info_mask_shared_by_all =			\
-		BIT(IIO_CHAN_INFO_SAMP_FREQ) |		\
-		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
+		BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
 	.info_mask_shared_by_all_available =		\
-		BIT(IIO_CHAN_INFO_SAMP_FREQ) |		\
-		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
+		BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
 	.ext_info = ads1299_ext_info,			\
 	.event_spec = ads1299_events,			\
 	.num_event_specs = ARRAY_SIZE(ads1299_events),	\
@@ -652,12 +653,11 @@ static int ads1299_get_gain(struct ads1299_private *priv, unsigned int channel)
 	return ads1299_pga_gain[FIELD_GET(ADS1299_MASK_CH_PGA, regval)];
 }
 
-/* One gain for every channel */
-static int ads1299_set_gain(struct ads1299_private *priv, int gain)
+/* The gain of one channel's PGA; its scale follows */
+static int ads1299_set_gain(struct ads1299_private *priv, unsigned int channel,
+			    int gain)
 {
 	unsigned int setting;
-	unsigned int i;
-	int ret;
 
 	for (setting = 0; setting < ARRAY_SIZE(ads1299_pga_gain); setting++) {
 		if (ads1299_pga_gain[setting] == gain)
@@ -666,15 +666,9 @@ static int ads1299_set_gain(struct ads1299_private *priv, int gain)
 	if (setting == ARRAY_SIZE(ads1299_pga_gain))
 		return -EINVAL;
 
-	for (i = 0; i < priv->num_adc_channels; i++) {
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(i),
-					 ADS1299_MASK_CH_PGA,
-					 FIELD_PREP(ADS1299_MASK_CH_PGA, setting));
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(channel),
+				  ADS1299_MASK_CH_PGA,
+				  FIELD_PREP(ADS1299_MASK_CH_PGA, setting));
 }
 
 /* The MUX applies to every channel at once */
@@ -874,7 +868,7 @@ static int ads1299_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ads1299_get_samp_freq(priv, val);
 	case IIO_CHAN_INFO_HARDWAREGAIN:
-		ret = ads1299_get_gain(priv, 0);
+		ret = ads1299_get_gain(priv, chan->channel);
 		if (ret < 0)
 			return ret;
 		*val = ret;
@@ -910,12 +904,19 @@ static int ads1299_write_raw(struct iio_dev *indio_dev,
 			     int val2, long mask)
 {
 	struct ads1299_private *priv = iio_priv(indio_dev);
+	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ads1299_set_samp_freq(priv, val);
 	case IIO_CHAN_INFO_HARDWAREGAIN:
-		return ads1299_set_gain(priv, val);
+		/* Not while running: the channel's scale would change */
+		ret = iio_device_claim_direct_mode(indio_dev);
+		if (ret)
+			return ret;
+		ret = ads1299_set_gain(priv, chan->channel, val);
+		iio_device_release_direct_mode(indio_dev);
+		return ret;
 	default:
 		return -EINVAL;
 	}
@@ -2285,15 +2286,14 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	s32 offset[ADS1299_MAX_CHANNELS];
 	s32 level[ADS1299_MAX_CHANNELS];
 	s32 pp[ADS1299_MAX_CHANNELS];
-	u64 min_amp = U64_MAX;
-	u64 max_amp = 0;
+	int gain[ADS1299_MAX_CHANNELS];
 	s32 noise_pp = 0;
 	u64 expected;
 	u64 window;
 	u64 ceiling;
+	u64 amp;
 	unsigned int ch;
 	int vref_uv;
-	int gain;
 	int restore;
 	int ret;
 
@@ -2301,16 +2301,12 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	if (vref_uv <= 0)
 		return vref_uv < 0 ? vref_uv : -EINVAL;
 
-	gain = ads1299_get_gain(priv, 0);
-	if (gain < 0)
-		return gain;
-
-	expected = div_u64((u64)gain << (ADS1299_BITS_PER_SAMPLE - 1),
-			   ADS1299_TEST_SIGNAL_DIVISOR);
-	window = div_u64(expected * ADS1299_SELF_TEST_TOLERANCE_PCT, 100);
-	ceiling = div_u64((u64)ADS1299_SELF_TEST_NOISE_UV_PP * (u64)gain <<
-				  (ADS1299_BITS_PER_SAMPLE - 1),
-			  (u32)vref_uv);
+	/* Each channel is judged at its own gain */
+	for (ch = 0; ch < priv->num_adc_channels; ch++) {
+		gain[ch] = ads1299_get_gain(priv, ch);
+		if (gain[ch] < 0)
+			return gain[ch];
+	}
 
 	/* Step 1 - inputs shorted, generator off: noise and offset */
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
@@ -2320,14 +2316,16 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	if (!ret)
 		ret = ads1299_sample_stats(priv, ADS1299_SELF_TEST_READINGS,
 					   offset, pp);
-	if (!ret) {
-		for (ch = 0; ch < priv->num_adc_channels; ch++)
-			noise_pp = max(noise_pp, pp[ch]);
-		if ((u64)noise_pp > ceiling) {
+	for (ch = 0; !ret && ch < priv->num_adc_channels; ch++) {
+		ceiling = (u64)ADS1299_SELF_TEST_NOISE_UV_PP * (u64)gain[ch];
+		ceiling = div_u64(ceiling << (ADS1299_BITS_PER_SAMPLE - 1),
+				  (u32)vref_uv);
+		noise_pp = max(noise_pp, pp[ch]);
+		if ((u64)pp[ch] > ceiling) {
 			dev_err(dev,
-				"self test: shorted-input noise is %d codes peak to peak, ceiling %llu (%d uV at gain %d)\n",
-				noise_pp, ceiling, ADS1299_SELF_TEST_NOISE_UV_PP,
-				gain);
+				"self test: channel %u shorted-input noise is %d codes peak to peak, ceiling %llu (%d uV at gain %d)\n",
+				ch, pp[ch], ceiling,
+				ADS1299_SELF_TEST_NOISE_UV_PP, gain[ch]);
 			ret = -EIO;
 		}
 	}
@@ -2344,17 +2342,16 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	if (!ret)
 		ret = ads1299_sample_stats(priv, ADS1299_SELF_TEST_READINGS,
 					   level, pp);
-	if (!ret) {
-		for (ch = 0; ch < priv->num_adc_channels; ch++) {
-			u64 amp = abs((s64)level[ch] - offset[ch]);
-
-			min_amp = min(min_amp, amp);
-			max_amp = max(max_amp, amp);
-		}
-		if (min_amp + window < expected || max_amp > expected + window) {
+	for (ch = 0; !ret && ch < priv->num_adc_channels; ch++) {
+		expected = (u64)gain[ch] << (ADS1299_BITS_PER_SAMPLE - 1);
+		expected = div_u64(expected, ADS1299_TEST_SIGNAL_DIVISOR);
+		window = div_u64(expected * ADS1299_SELF_TEST_TOLERANCE_PCT,
+				 100);
+		amp = abs((s64)level[ch] - offset[ch]);
+		if (amp + window < expected || amp > expected + window) {
 			dev_err(dev,
-				"self test: test signal DC level is %llu..%llu codes from the shorted-input offset across channels, expected %llu +-%llu at gain %d\n",
-				min_amp, max_amp, expected, window, gain);
+				"self test: channel %u test signal DC level is %llu codes from the shorted-input offset, expected %llu +-%llu at gain %d\n",
+				ch, amp, expected, window, gain[ch]);
 			ret = -EIO;
 		}
 	}
@@ -2371,8 +2368,8 @@ static int ads1299_self_test(struct ads1299_private *priv)
 		return restore;
 
 	dev_info(dev,
-		 "self test passed: test signal DC level %llu..%llu codes from offset (expected %llu), shorted-input noise %d codes\n",
-		 min_amp, max_amp, expected, noise_pp);
+		 "self test passed: %u channels at their gains, shorted-input noise up to %d codes\n",
+		 priv->num_adc_channels, noise_pp);
 
 	return 0;
 }
