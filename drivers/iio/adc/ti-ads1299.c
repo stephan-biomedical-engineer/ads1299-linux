@@ -269,6 +269,7 @@ struct ads1299_private {
 	struct spi_device *spi;
 	struct regulator *reg_avdd;
 	struct regulator *reg_vref;
+	struct regulator *reg_biasref;
 	struct clk *clk;
 	struct clk_hw clk_out;
 	struct regmap *regmap;
@@ -442,10 +443,29 @@ static int ads1299_set_gain(struct ads1299_private *priv, int gain)
 }
 
 /* The MUX applies to every channel at once */
+/*
+ * MUX = 010 measures BIASIN only with CONFIG3.BIAS_MEAS set [SBAS499 Table
+ * 15], so the bit follows the MUX: set before a channel moves there, cleared
+ * after the last one has left.
+ */
+static int ads1299_set_bias_meas(struct ads1299_private *priv, bool on)
+{
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+				  ADS1299_MASK_CONFIG3_BIAS_MEAS,
+				  on ? ADS1299_MASK_CONFIG3_BIAS_MEAS : 0);
+}
+
 static int ads1299_set_mux(struct ads1299_private *priv, unsigned int mux)
 {
+	bool bias_meas = mux == ADS1299_MUX_BIAS_MEAS;
 	unsigned int i;
 	int ret;
+
+	if (bias_meas) {
+		ret = ads1299_set_bias_meas(priv, true);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < priv->num_adc_channels; i++) {
 		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(i),
@@ -455,7 +475,7 @@ static int ads1299_set_mux(struct ads1299_private *priv, unsigned int mux)
 			return ret;
 	}
 
-	return 0;
+	return bias_meas ? 0 : ads1299_set_bias_meas(priv, false);
 }
 
 static int ads1299_read_one(struct ads1299_private *priv, int chan_index)
@@ -893,9 +913,10 @@ static int ads1299_set_bias(struct ads1299_private *priv,
 
 	if (mode == ADS1299_BIAS_DERIVED)
 		derivation = GENMASK(priv->num_adc_channels - 1, 0);
+	/* BIASREF from (AVDD + AVSS) / 2 unless the board feeds the pin */
 	if (mode != ADS1299_BIAS_OFF)
-		config3 = ADS1299_MASK_CONFIG3_BIASREF_INT |
-			  ADS1299_MASK_CONFIG3_PD_BIAS;
+		config3 = ADS1299_MASK_CONFIG3_PD_BIAS |
+			  (priv->reg_biasref ? 0 : ADS1299_MASK_CONFIG3_BIASREF_INT);
 
 	if (mode == ADS1299_BIAS_OFF) {
 		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
@@ -1336,6 +1357,28 @@ static void ads1299_reg_disable(void *reg)
 	regulator_disable(reg);
 }
 
+/* An optional supply, enabled for the life of the device; NULL when absent */
+static int ads1299_get_optional_supply(struct device *dev, const char *id,
+				       struct regulator **reg)
+{
+	int ret;
+
+	*reg = devm_regulator_get_optional(dev, id);
+	if (IS_ERR(*reg)) {
+		if (PTR_ERR(*reg) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(*reg),
+					     "Failed to get %s regulator\n", id);
+		*reg = NULL;
+		return 0;
+	}
+
+	ret = regulator_enable(*reg);
+	if (ret)
+		return ret;
+
+	return devm_add_action_or_reset(dev, ads1299_reg_disable, *reg);
+}
+
 static const struct regmap_range ads1299_regmap_volatile_range[] = {
 	regmap_reg_range(ADS1299_REG_LOFF_STATP, ADS1299_REG_LOFF_STATN),
 };
@@ -1753,23 +1796,14 @@ static int ads1299_probe(struct spi_device *spi)
 				     "Cannot get reset GPIO\n");
 
 	/* VREF can be supplied externally, otherwise use the internal 4.5 V */
-	priv->reg_vref = devm_regulator_get_optional(dev, "vref");
-	if (IS_ERR(priv->reg_vref)) {
-		if (PTR_ERR(priv->reg_vref) != -ENODEV)
-			return dev_err_probe(dev, PTR_ERR(priv->reg_vref),
-					     "Failed to get vref regulator\n");
+	ret = ads1299_get_optional_supply(dev, "vref", &priv->reg_vref);
+	if (ret)
+		return ret;
 
-		priv->reg_vref = NULL;
-	} else {
-		ret = regulator_enable(priv->reg_vref);
-		if (ret)
-			return ret;
-
-		ret = devm_add_action_or_reset(dev, ads1299_reg_disable,
-					       priv->reg_vref);
-		if (ret)
-			return ret;
-	}
+	/* So can BIASREF, otherwise the part makes (AVDD + AVSS) / 2 */
+	ret = ads1299_get_optional_supply(dev, "biasref", &priv->reg_biasref);
+	if (ret)
+		return ret;
 
 	priv->clk = devm_clk_get_optional_enabled(dev, "clk");
 	if (IS_ERR(priv->clk))
