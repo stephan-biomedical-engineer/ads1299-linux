@@ -1,75 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
-/* TI ADS1299 biopotential (EEG) front-end driver
+/*
+ * TI ADS1299 8-channel, 24-bit biopotential ADC
  *
  * Copyright (C) 2023 - 2024 Topic Embedded Products
- *     drivers/iio/adc/ti-ads1298.c, Mike Looijmans <mike.looijmans@topic.nl>,
- *     mainline since Linux 6.9. This file is a derivative of that driver.
- * Copyright (C) 2026 MedPlatform (TCC)
+ * Copyright (C) 2026 Stephan Costa Barros <stephanbrrs8@gmail.com>
  *
- * Provenance, because it is the point (implementation_plan_iio_afe.md §3):
- * this is NOT software of unknown provenance. It is a derivative of a driver
- * that went through the IIO maintainers' review, whose author, history and
- * review are public and citable, adapted here for the ADS1299 - the EEG
- * sibling of the ADS1298 in the same ADS129x family. The alternative that was
- * rejected was adopting an unmaintained third-party driver, which would have
- * added SOUP in the kernel's trust domain (IEC 62304 §7.1.2-7.1.3).
+ * Based on ti-ads1298.c by Mike Looijmans <mike.looijmans@topic.nl>.
  *
- * Backport 6.9 -> 6.6, measured rather than assumed: every kernel interface
- * the mainline file uses exists unchanged in both kernels this repository
- * builds (linux-stm32mp 6.6.129 and linux-yocto 6.6.144) - cleanup.h and the
- * spinlock_irqsave guard, REGCACHE_MAPLE, regmap_config's .reg_read/.reg_write,
- * MICROHZ_PER_HZ, get_unaligned_be24, devm_iio_kfifo_buffer_setup. The one
- * release of API drift the plan budgeted for turned out to be zero lines.
+ * Datasheet: https://www.ti.com/lit/ds/symlink/ads1299.pdf
  *
- * ADS1298 -> ADS1299: what actually differs, and why each one matters
- * ------------------------------------------------------------------
- *  - PGA gains. ADS1298 {6,1,2,3,4,8,12}; ADS1299 {1,2,4,6,8,12,24}. Same
- *    field, different table - a silent 4x scale error if carried over.
- *  - Reference. ADS1298 selects 2.4 V or 4.0 V with CONFIG3 bit 5; the ADS1299
- *    internal reference is 4.5 V and that bit is reserved. Hardcoding the
- *    ADS1298 choice would put a 12.5% gain error on every trace.
- *  - Data rate. ADS1298 has an HR/LP bit that shifts the divider by 6 or 7;
- *    the ADS1299 has no such bit, the divider shift is always 7, and the rate
- *    set is the discrete {250 .. 16000} SPS the plan's safety envelope names.
- *  - CHnSET out of reset is 0x61 on the ADS1299: gain 24 and MUX = "input
- *    shorted". A driver that does not program the MUX measures nothing and
- *    looks like it works. The ADS1298 driver never touches MUX because its
- *    reset value is the normal input.
- *  - ID register field layout differs (see the masks below).
- *
- * What this file adds beyond the adaptation
- * -----------------------------------------
- *  - A timestamp channel. The mainline driver declares none, and for a
- *    clinical record the instant a sample was converted is not optional. This
- *    is the first candidate to send back upstream.
- *  - An internal hrtimer source for boards where DRDY cannot reach the host as
- *    an interrupt - which is the USB/MCP2210 link, where the bridge offers a
- *    counted GPIO and no asynchronous delivery at all. The timestamp is then
- *    the host's, not the converter's, and the driver says so through
- *    "timestamp_source" so that no record can quietly claim more fidelity than
- *    it has.
- *  - A lost-sample counter, exported, because "samples lost under load" is one
- *    of the measurements docs/RESULTS.md §9 lists as missing.
- *  - A probe-time self test of the analogue path: the inputs shorted and the
- *    noise floor and offset measured, then the internal test generator held
- *    at DC on every input and its level measured against that offset. A
- *    front-end that fails is never registered.
- *    This is the shape of self test IEC 60601-1 §14 expects, and it lives here
- *    because judging the answer needs this part's generator amplitude and
- *    noise floor - facts no layer above the kernel may hold. Running it at
- *    probe, with no ABI of its own, is the IIO convention (adis_self_test() in
- *    drivers/iio/imu/adis.c, ak8974_selftest() in the magnetometer driver).
- *  - An input MUX control, for bench work on the analogue path.
- *
- * DATASHEET STATUS. The register map has been read against SBAS499 Table 11 and
- * the per-register tables 12 to 28, and each constant carries its table number.
- * The one thing the datasheet did not settle, the test generator's amplitude,
- * was measured on silicon instead; see the self test criteria below.
- *
- * Checked against one part (ADS1299, ID 0x3e, behind a USB-SPI bridge): the
- * ID and every reset value of Table 11, the generator amplitude, and the
- * behaviour of the generator in single-shot mode. Everything else is checked
- * against the datasheet only, which is a different claim.
+ * Besides the voltage channels, the driver provides:
+ *  - a timestamp channel, taken in the DRDY interrupt or, where DRDY cannot
+ *    reach the host as an interrupt, from an internal hrtimer; the source in
+ *    use is reported by "timestamp_source"
+ *  - "lost_samples", the conversions the host did not collect
+ *  - a probe-time self test of the analogue path: shorted-input noise and
+ *    offset, then the test generator held at DC; a part that fails is not
+ *    registered
+ *  - input MUX, test signal and bias drive controls, and the lead-off status
  */
 
 #include <linux/bitfield.h>
@@ -97,206 +45,162 @@
 
 #include <asm/unaligned.h>
 
-/* Commands - identical to the ADS1298, the family shares the command set */
-#define ADS1299_CMD_WAKEUP	0x02
-#define ADS1299_CMD_STANDBY	0x04
-#define ADS1299_CMD_RESET	0x06
-#define ADS1299_CMD_START	0x08
-#define ADS1299_CMD_STOP	0x0a
-#define ADS1299_CMD_RDATAC	0x10
-#define ADS1299_CMD_SDATAC	0x11
-#define ADS1299_CMD_RDATA	0x12
-#define ADS1299_CMD_RREG	0x20
-#define ADS1299_CMD_WREG	0x40
+/* Commands */
+#define ADS1299_CMD_WAKEUP			0x02
+#define ADS1299_CMD_STANDBY			0x04
+#define ADS1299_CMD_RESET			0x06
+#define ADS1299_CMD_START			0x08
+#define ADS1299_CMD_STOP			0x0a
+#define ADS1299_CMD_RDATAC			0x10
+#define ADS1299_CMD_SDATAC			0x11
+#define ADS1299_CMD_RDATA			0x12
+#define ADS1299_CMD_RREG			0x20
+#define ADS1299_CMD_WREG			0x40
 
-/* Registers */
-#define ADS1299_REG_ID		0x00
 /*
- * [SBAS499 Table 12 / Figure 50]
- * ID is REV_ID[7:5] | 1 | DEV_ID[3:2] | NU_CH[1:0], and the reset
- * value of the 8-channel part is 0x3e. So the part-identifying field is
- * bits [4:2] = 0b111, and the channel count is a TWO bit field - not the three
- * bit field the ADS1298 has, whose bit 2 belongs to DEV_ID here. Using the
- * mainline masks unmodified would decode an ADS1299 as a 16-channel unknown
- * device, which is a good failure (it refuses to probe) but for the wrong
- * reason.
- *
- * 0x3e is the reset value of ONE revision: REV_ID is documented as subject to
- * change without notice, so the whole byte must never be compared. The code
- * below masks. NU_CH: 00 is 4 channels, 01 is 6, 10 is 8, and 11 is undefined,
- * which is why the > MAX_CHANNELS test is a guard and not decoration.
+ * [SBAS499 Table 12] ID: REV_ID[7:5] | 1 | DEV_ID[3:2] | NU_CH[1:0], 0x3e on
+ * the 8-channel part. REV_ID may change between revisions, so the byte is
+ * masked and never compared whole. NU_CH: 00 = 4, 01 = 6, 10 = 8 channels,
+ * 11 undefined.
  */
+#define ADS1299_REG_ID				0x00
+#define ADS1299_MASK_REV_ID			GENMASK(7, 5)
 #define ADS1299_MASK_ID_FAMILY			GENMASK(4, 2)
 #define ADS1299_MASK_ID_CHANNELS		GENMASK(1, 0)
 #define ADS1299_ID_FAMILY_ADS129X		0x7
 
-#define ADS1299_REG_CONFIG1	0x01
 /*
- * [SBAS499 Table 13 / Figure 51] CONFIG1, reset 0x96.
- *
- * TWO reserved fields: bit 7 must always be written 1, and bits 4:3 must
- * always be written 2h. 0x90 is the two of them together, and 0x90 | DR is the
- * whole register - 0x96 at the reset data rate.
- *
- * CONFIG1 is only ever touched with regmap_update_bits() on the DR field, so
- * these bits keep the value the part came up with. The full value is spelled
- * out anyway: reaching for BIT(7) alone as a "reserved value", the way CONFIG2
- * and CONFIG3 are written whole, would clear bit 4 on every rate change.
+ * [SBAS499 Table 13] CONFIG1, reset 0x96. Reserved: bit 7 is always 1 and
+ * bits 4:3 always 2h. ODR = f_CLK >> (7 + DR): 16 kSPS at DR = 0, 250 SPS at
+ * DR = 6; DR = 7 is reserved.
  */
+#define ADS1299_REG_CONFIG1			0x01
 #define ADS1299_MASK_CONFIG1_RESERVED_HI	BIT(7)
+#define ADS1299_MASK_CONFIG1_DAISY_EN		BIT(6)
+#define ADS1299_MASK_CONFIG1_CLK_EN		BIT(5)
 #define ADS1299_MASK_CONFIG1_RESERVED_LO	GENMASK(4, 3)
+#define ADS1299_MASK_CONFIG1_DR			GENMASK(2, 0)
 #define ADS1299_CONFIG1_RESERVED_VALUE					\
 	(ADS1299_MASK_CONFIG1_RESERVED_HI |				\
 	 FIELD_PREP(ADS1299_MASK_CONFIG1_RESERVED_LO, 0x2))
-#define ADS1299_MASK_CONFIG1_DAISY_EN		BIT(6)
-#define ADS1299_MASK_CONFIG1_CLK_EN		BIT(5)
-#define ADS1299_MASK_CONFIG1_DR			GENMASK(2, 0)
-/*
- * ODR = f_CLK >> (7 + DR), with the internal 2.048 MHz oscillator giving
- * 16 kSPS at DR=0 and 250 SPS at DR=6. DR=7 is reserved. There is no HR/LP
- * bit: unlike the ADS1298 the shift is not mode dependent.
- */
 #define ADS1299_SHIFT_DR			7
 #define ADS1299_LOWEST_DR			0x06
 
-#define ADS1299_REG_CONFIG2	0x02
 /*
- * [SBAS499 Table 14 / Figure 52] CONFIG2, reset 0xc0.
- *
- * There are TWO reserved fields here and neither is don't-care: bits 7:5 must
- * always be written 6h, and bit 3 must always be written 0. The reserved bits
- * are therefore a VALUE and not a mask of ones - writing GENMASK(7, 5) would
- * put 7h into a field the datasheet says is always 6h.
+ * [SBAS499 Table 14] CONFIG2, reset 0xc0. Reserved: bits 7:5 are always 6h,
+ * a value and not a mask of ones, and bit 3 is always 0.
  */
+#define ADS1299_REG_CONFIG2			0x02
 #define ADS1299_MASK_CONFIG2_RESERVED		GENMASK(7, 5)
-#define ADS1299_CONFIG2_RESERVED_VALUE					\
-	FIELD_PREP(ADS1299_MASK_CONFIG2_RESERVED, 0x6)
 #define ADS1299_MASK_CONFIG2_INT_CAL		BIT(4)
-/* Bit 3 is the second reserved field, always 0, so it gets no macro. */
 #define ADS1299_MASK_CONFIG2_CAL_AMP		BIT(2)
 #define ADS1299_MASK_CONFIG2_CAL_FREQ		GENMASK(1, 0)
+#define ADS1299_CONFIG2_RESERVED_VALUE					\
+	FIELD_PREP(ADS1299_MASK_CONFIG2_RESERVED, 0x6)
 #define ADS1299_CAL_FREQ_SLOW			0	/* f_CLK / 2^21, ~1 Hz */
 #define ADS1299_CAL_FREQ_FAST			1	/* f_CLK / 2^20, ~2 Hz */
+/* 2 is "do not use" */
 #define ADS1299_CAL_FREQ_DC			3
 
-#define ADS1299_REG_CONFIG3	0x03
 /*
- * [SBAS499 Table 15 / Figure 53] CONFIG3, reset 0x60.
- *
- * Every field below sits where the datasheet puts it. Two notes for whoever
- * checks it next.
- *
- * The reserved field 6:5 must always be written 3h, and 3h happens to be "both
- * bits set", so here the mask and the mandated value coincide. That is a
- * coincidence of this register and not a rule - CONFIG2's reserved field is 6h
- * over three bits - so the value is spelled out with FIELD_PREP anyway, and the
- * two registers read the same way.
- *
- * The datasheet calls bit 7 PD_REFBUF, "power-down reference buffer", and then
- * gives it inverted polarity: 0 powers the buffer DOWN, 1 enables it. The macro
- * is named for what setting it does, because "val |= PD_REFBUF" to power
- * something down is a bug waiting to be written. The datasheet name is recorded
- * here so a search for PD_REFBUF finds it.
+ * [SBAS499 Table 15] CONFIG3, reset 0x60. Reserved bits 6:5 are always 3h.
+ * PWR_REFBUF is the datasheet's PD_REFBUF, renamed because 1 powers the buffer
+ * up. BIAS_STAT is read-only, and CONFIG3 is cached: reading it needs the
+ * register in the volatile table.
  */
-#define ADS1299_MASK_CONFIG3_PWR_REFBUF		BIT(7)	/* datasheet: PD_REFBUF */
+#define ADS1299_REG_CONFIG3			0x03
+#define ADS1299_MASK_CONFIG3_PWR_REFBUF		BIT(7)
 #define ADS1299_MASK_CONFIG3_RESERVED		GENMASK(6, 5)
-#define ADS1299_CONFIG3_RESERVED_VALUE					\
-	FIELD_PREP(ADS1299_MASK_CONFIG3_RESERVED, 0x3)
 #define ADS1299_MASK_CONFIG3_BIAS_MEAS		BIT(4)
 #define ADS1299_MASK_CONFIG3_BIASREF_INT	BIT(3)
 #define ADS1299_MASK_CONFIG3_PD_BIAS		BIT(2)
 #define ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS	BIT(1)
-/*
- * Bit 0 is BIAS_STAT, read-only, the lead-off status of the BIAS electrode: 0
- * connected, 1 not connected. It has a macro and no user.
- *
- * Reporting it is not just an attribute: CONFIG3 is cached (REGCACHE_MAPLE, and
- * the volatile table covers only LOFF_STATP..LOFF_STATN), so a read would come
- * back as the value that was written and this bit would report "connected"
- * forever. The register has to join the volatile table in the same change.
- */
 #define ADS1299_MASK_CONFIG3_BIAS_STAT		BIT(0)
+#define ADS1299_CONFIG3_RESERVED_VALUE					\
+	FIELD_PREP(ADS1299_MASK_CONFIG3_RESERVED, 0x3)
 
 /*
- * [SBAS499 Table 16] LOFF, reset 0x00: COMP_TH[7:5], reserved bit 4, written 0,
- * ILEAD_OFF[3:2], FLEAD_OFF[1:0]. This driver never writes it, so the part
- * keeps its reset value - comparator thresholds 95%/5%, DC lead-off detection,
- * 6 nA. That is a device-configuration choice made by leaving the register at
- * reset; see the note on LOFF_SENSP below.
+ * [SBAS499 Table 16] LOFF, reset 0x00. Bit 4 is reserved, always 0. One
+ * COMP_TH code sets both comparators: positive % / negative %.
  */
-#define ADS1299_REG_LOFF	0x04
-/* [SBAS499 Table 17 / Figure 55] CHnSET, reset 0x61 */
-#define ADS1299_REG_CHnSET(n)	(0x05 + (n))
-#define ADS1299_MASK_CH_PD		BIT(7)
-#define ADS1299_MASK_CH_PGA		GENMASK(6, 4)
-#define ADS1299_MASK_CH_SRB2		BIT(3)
-#define ADS1299_MASK_CH_MUX		GENMASK(2, 0)
+#define ADS1299_REG_LOFF			0x04
+#define ADS1299_MASK_LOFF_COMP_TH		GENMASK(7, 5)
+#define ADS1299_MASK_LOFF_ILEAD_OFF		GENMASK(3, 2)
+#define ADS1299_MASK_LOFF_FLEAD_OFF		GENMASK(1, 0)
+#define ADS1299_LOFF_COMP_TH_95_5		0
+#define ADS1299_LOFF_COMP_TH_92_5_7_5		1
+#define ADS1299_LOFF_COMP_TH_90_10		2
+#define ADS1299_LOFF_COMP_TH_87_5_12_5		3
+#define ADS1299_LOFF_COMP_TH_85_15		4
+#define ADS1299_LOFF_COMP_TH_80_20		5
+#define ADS1299_LOFF_COMP_TH_75_25		6
+#define ADS1299_LOFF_COMP_TH_70_30		7
+#define ADS1299_LOFF_ILEAD_OFF_6NA		0
+#define ADS1299_LOFF_ILEAD_OFF_24NA		1
+#define ADS1299_LOFF_ILEAD_OFF_6UA		2
+#define ADS1299_LOFF_ILEAD_OFF_24UA		3
+#define ADS1299_LOFF_FLEAD_OFF_DC		0
+#define ADS1299_LOFF_FLEAD_OFF_AC_7_8HZ		1	/* f_CLK / 2^18 */
+#define ADS1299_LOFF_FLEAD_OFF_AC_31_2HZ	2	/* f_CLK / 2^16 */
+#define ADS1299_LOFF_FLEAD_OFF_AC_FDR_DIV_4	3
+
+/* [SBAS499 Table 17] CHnSET, n = 1 to 8, reset 0x61 */
+#define ADS1299_REG_CHnSET(n)			(0x05 + (n))
+#define ADS1299_MASK_CH_PD			BIT(7)
+#define ADS1299_MASK_CH_PGA			GENMASK(6, 4)
+#define ADS1299_MASK_CH_SRB2			BIT(3)
+#define ADS1299_MASK_CH_MUX			GENMASK(2, 0)
+#define ADS1299_MUX_NORMAL			0
+#define ADS1299_MUX_SHORTED			1
+#define ADS1299_MUX_BIAS_MEAS			2	/* with CONFIG3.BIAS_MEAS */
+#define ADS1299_MUX_MVDD			3
+#define ADS1299_MUX_TEMPERATURE			4
+#define ADS1299_MUX_TEST_SIGNAL			5
+#define ADS1299_MUX_BIAS_DRP			6	/* the positive electrode drives */
+#define ADS1299_MUX_BIAS_DRN			7	/* the negative electrode drives */
 
 /*
- * [SBAS499 Tables 18, 19 / Figures 56, 57] One bit per electrode: which channel
- * inputs are averaged to derive the bias the amplifier drives back out.
- *
- * The bits above the part's channel count do not exist - [5:4] on the
- * ADS1299-4, [7:6] on the -4 and the -6 - and the datasheet says to write 0
- * there. Deriving the mask from num_adc_channels, which comes from the ID
- * register, satisfies that without a variant table.
+ * [SBAS499 Tables 18 to 24] One bit per channel. Bits above the part's channel
+ * count must be written 0, so masks are derived from NU_CH. A LOFF_STAT bit is
+ * valid only where its LOFF_SENS bit is set.
  */
-#define ADS1299_REG_BIAS_SENSP	0x0d
-#define ADS1299_REG_BIAS_SENSN	0x0e
+#define ADS1299_REG_BIAS_SENSP			0x0d
+#define ADS1299_REG_BIAS_SENSN			0x0e
+#define ADS1299_REG_LOFF_SENSP			0x0f
+#define ADS1299_REG_LOFF_SENSN			0x10
+#define ADS1299_REG_LOFF_FLIP			0x11
+#define ADS1299_REG_LOFF_STATP			0x12
+#define ADS1299_REG_LOFF_STATN			0x13
+
+/* [SBAS499 Table 25] GPIO, reset 0x0f. GPIOC: 0 output, 1 input */
+#define ADS1299_REG_GPIO			0x14
+#define ADS1299_MASK_GPIO_DATA			GENMASK(7, 4)
+#define ADS1299_MASK_GPIO_CONTROL		GENMASK(3, 0)
 
 /*
- * [SBAS499 Tables 20, 21 / Figures 58, 59] One bit per electrode, and this
- * driver never writes either of them.
- *
- * The datasheet is explicit: the LOFF_STATP bits are only valid where the
- * corresponding LOFF_SENSP bit is set, and the same holds for the negative
- * side. Powering the comparators on in CONFIG4 is therefore only half of what
- * lead-off detection needs. With SENSP/SENSN left at 0, LOFF_STATP and
- * LOFF_STATN read 00 00, which is indistinguishable from every electrode being
- * attached.
- *
- * Until detection is enabled per channel, lead_off_status says "disabled"
- * rather than emitting a number the datasheet says to ignore. Enabling it
- * drives the lead-off current into the electrodes, and its magnitude and
- * frequency come from LOFF (0x04), which nothing here programs either.
- *
- * This comment used to sit above the two BIAS registers and cite these table
- * numbers for them, which are the lead-off ones. The registers it describes are
- * below it now.
+ * [SBAS499 Table 26] MISC1, reset 0x00. SRB1 ties the SRB1 pin to every
+ * channel's inverting input; the other bits are reserved, always 0.
  */
-#define ADS1299_REG_LOFF_SENSP	0x0f
-#define ADS1299_REG_LOFF_SENSN	0x10
-#define ADS1299_REG_LOFF_FLIP	0x11
-#define ADS1299_REG_LOFF_STATP	0x12
-#define ADS1299_REG_LOFF_STATN	0x13
-#define ADS1299_REG_GPIO	0x14
-#define ADS1299_REG_MISC1	0x15
-#define ADS1299_REG_MISC2	0x16
-#define ADS1299_REG_CONFIG4	0x17
+#define ADS1299_REG_MISC1			0x15
+#define ADS1299_MASK_MISC1_SRB1			BIT(5)
+
+/* [SBAS499 Table 27] MISC2, reset 0x00, every bit reserved, always 0 */
+#define ADS1299_REG_MISC2			0x16
+
 /*
- * [SBAS499 Table 28 / Figure 66] CONFIG4, reset 0x00. Note the inverted name,
- * the same shape as PD_REFBUF: the field is called PD_LOFF_COMP, "lead-off
- * comparator power-down", and 1 ENABLES the comparators.
+ * [SBAS499 Table 28] CONFIG4, reset 0x00. PD_LOFF_COMP keeps the datasheet's
+ * name although 1 powers the comparators up.
  */
+#define ADS1299_REG_CONFIG4			0x17
 #define ADS1299_MASK_CONFIG4_SINGLE_SHOT	BIT(3)
 #define ADS1299_MASK_CONFIG4_PD_LOFF_COMP	BIT(1)
 
 /*
- * What the bias amplifier is doing, and the names say which because the three
- * are clinically different and a boolean cannot tell them apart.
- *
- *   off       - the buffer is powered down. Reset state, and what this driver
- *               did before this existed.
- *   reference - the buffer drives BIASREF, generated internally as
- *               (AVDD + AVSS) / 2. A DC bias for the subject and NO active
- *               common-mode rejection: nothing measured feeds back.
- *   derived   - the buffer drives the inverse of the average of every enabled
- *               channel's inputs, which is the driven-electrode arrangement
- *               that actually rejects common mode.
- *
- * "bias drive is on" in a prescription means derived. reference exists because
- * the part can do it and because a montage might want a bias with no feedback,
- * not because anything here asks for it yet.
+ * Bias amplifier mode:
+ *   off       - powered down, the reset state
+ *   reference - drives BIASREF, (AVDD + AVSS) / 2: a DC bias, no feedback
+ *   derived   - drives the inverted average of the electrodes' inputs, which
+ *               is what rejects common mode
  */
 enum ads1299_bias {
 	ADS1299_BIAS_OFF,
@@ -310,50 +214,26 @@ static const char * const ads1299_bias_names[] = {
 	[ADS1299_BIAS_DERIVED]	 = "derived",
 };
 
-/* MUX field of CHnSET - what the channel is actually connected to */
-#define ADS1299_MUX_NORMAL		0
-#define ADS1299_MUX_SHORTED		1
-#define ADS1299_MUX_BIAS_MEAS		2
-#define ADS1299_MUX_MVDD		3
-#define ADS1299_MUX_TEMPERATURE		4
-#define ADS1299_MUX_TEST_SIGNAL		5
-#define ADS1299_MUX_BIAS_DRP		6
-#define ADS1299_MUX_BIAS_DRN		7
+#define ADS1299_MAX_CHANNELS			8
+#define ADS1299_BITS_PER_SAMPLE			24
+#define ADS1299_CLK_RATE_HZ			2048000
+#define ADS1299_CLOCKS_TO_USECS(x)					\
+	(DIV_ROUND_UP((x) * MICROHZ_PER_HZ, ADS1299_CLK_RATE_HZ))
 
-#define ADS1299_MAX_CHANNELS	8
-#define ADS1299_BITS_PER_SAMPLE	24
-#define ADS1299_CLK_RATE_HZ	2048000
-#define ADS1299_CLOCKS_TO_USECS(x) \
-		(DIV_ROUND_UP((x) * MICROHZ_PER_HZ, ADS1299_CLK_RATE_HZ))
-/*
- * Register access needs 4 clocks to decode, so the transfer speed is limited
- * while doing it rather than inserting inter-byte delays.
- */
-#define ADS1299_SPI_BUS_SPEED_SLOW	ADS1299_CLK_RATE_HZ
-#define ADS1299_SPI_CMD_BUFFER_SIZE	3
-/* Status word plus 'n' 24-bit samples, plus the command byte */
+/* A command takes 4 t_CLK to decode, so register access runs at f_CLK */
+#define ADS1299_SPI_BUS_SPEED_SLOW		ADS1299_CLK_RATE_HZ
+#define ADS1299_SPI_CMD_BUFFER_SIZE		3
+/* Command byte, status word and n 24-bit samples */
 #define ADS1299_SPI_RDATA_BUFFER_SIZE(n)	(((n) + 1) * 3 + 1)
-#define ADS1299_SPI_RDATA_BUFFER_SIZE_MAX \
-		ADS1299_SPI_RDATA_BUFFER_SIZE(ADS1299_MAX_CHANNELS)
+#define ADS1299_SPI_RDATA_BUFFER_SIZE_MAX				\
+	ADS1299_SPI_RDATA_BUFFER_SIZE(ADS1299_MAX_CHANNELS)
 
 /*
- * Probe-time self test criteria.
- *
- * Table 14 gives the test signal as "1 x -(VREFP - VREFN) / 2400" without
- * saying whether that is a peak or a peak-to-peak figure. Measured on silicon,
- * gain 24, internal reference: the generator swings between -84384 and +82908
- * codes at ~1 Hz, and held at DC (CAL_FREQ = 11) it sits at -84378, against
- * -780 with the inputs shorted. So VREF/2400 is the PEAK amplitude, the DC
- * level is the negative one, and the expected DC level relative to the
- * shorted-input offset is gain * 2^23 / 2400 codes (83886 at gain 24; 83598
- * measured). In codes that holds whatever the reference is.
- *
- * Why DC and not the square wave: in single-shot mode every START restarts the
- * generator's divider, so a reading per START always lands on the same phase
- * and the ~1 Hz wave never appears to move - measured as 82884..82909 over
- * twenty readings, against -84384..82908 in continuous mode. A swing test run
- * the way this driver converts sees a flat line on good silicon. The DC level
- * has no phase to lose.
+ * Probe-time self test. The test signal is VREF / 2400 peak [SBAS499 Table 14,
+ * measured]; held at DC it sits gain * 2^23 / 2400 codes below the
+ * shorted-input offset (83886 at gain 24, 83598 measured). DC and not the
+ * square wave, because in single-shot mode every START restarts the
+ * generator's divider and each reading lands on the same phase.
  */
 #define ADS1299_TEST_SIGNAL_DIVISOR		2400
 /*
@@ -363,23 +243,15 @@ static const char * const ads1299_bias_names[] = {
  * and a channel stuck at the next gain down from 24 (-50%), well outside.
  */
 #define ADS1299_SELF_TEST_TOLERANCE_PCT		20
-/*
- * Shorted-input ceiling, microvolts peak to peak. Two orders of magnitude above
- * the datasheet noise figure: a test of "the analogue path is not broken", not
- * of "the board is quiet". The second needs a bench.
- */
+/* Shorted-input ceiling: catches a broken analogue path, not a noisy board */
 #define ADS1299_SELF_TEST_NOISE_UV_PP		10
 #define ADS1299_SELF_TEST_READINGS		10
 /* Conversions right after a MUX change carry its transient */
 #define ADS1299_SELF_TEST_DISCARD		2
 #define ADS1299_SELF_TEST_INTERVAL_MS		50
 
-/*
- * The internal reference, in microvolts. Fixed on this part; the ADS1298's
- * 2.4/4.0 V選択 does not exist here. An external reference is still supported
- * through the "vref" regulator, which is why this is only the fallback.
- */
-#define ADS1299_INTERNAL_VREF_UV	4500000
+/* Internal reference, used when no "vref" regulator is given */
+#define ADS1299_INTERNAL_VREF_UV		4500000
 
 enum ads1299_timestamp_source {
 	ADS1299_TS_DRDY_IRQ = 0,
@@ -404,11 +276,8 @@ struct ads1299_private {
 	 */
 	unsigned int rdata_xfer_busy;
 	/*
-	 * Samples the converter produced and the host never collected. Counted
-	 * because "sample loss under load" is a number this platform owes
-	 * (RESULTS.md §9) and because on the USB link it is the only way to
-	 * know: the bridge delivers no interrupt, so a missed conversion is
-	 * otherwise indistinguishable from a slower one.
+	 * Conversions the host never collected. Without DRDY as an interrupt
+	 * this is the only way to tell a missed conversion from a slow one.
 	 */
 	u64 lost_samples;
 
@@ -473,24 +342,14 @@ static const struct iio_chan_spec ads1299_channels[ADS1299_MAX_CHANNELS] = {
 	ADS1299_CHAN(7),
 };
 
-/*
- * The discrete set of output data rates, in the order of the DR field. The
- * converter accepts nothing between them, and exposing that through the IIO
- * ABI is what stops a configuration file asking for 300 SPS and silently
- * getting 250 - the safety envelope in the acquisition service checks set
- * membership for the same reason.
- */
+/* Output data rates in DR order; the part has nothing in between */
 static const int ads1299_samp_freq_avail[] = {
 	16000, 8000, 4000, 2000, 1000, 500, 250,
 };
 
 /*
- * PGA setting -> gain, indexed by the CHnSET PGA field.
- * [SBAS499 Table 17] 000..110 exactly; 111 is "do not use", which is why this
- * array has seven entries and not eight - an index of 7 is out of bounds by
- * construction rather than by a check that could be forgotten. The ADS1298's
- * table is {6,1,2,3,4,8,12}, so carrying it over would be a silent 4x scale
- * error at the reset setting.
+ * [SBAS499 Table 17] PGA field -> gain. 111 is "do not use", hence seven
+ * entries.
  */
 static const int ads1299_pga_gain[] = { 1, 2, 4, 6, 8, 12, 24 };
 
@@ -549,12 +408,7 @@ static int ads1299_get_gain(struct ads1299_private *priv, unsigned int channel)
 	return ads1299_pga_gain[FIELD_GET(ADS1299_MASK_CH_PGA, regval)];
 }
 
-/*
- * Gain is per channel in the hardware and shared by all here on purpose: an
- * EEG montage with different gains per electrode is not a configuration this
- * device offers clinically, and letting the ABI express it would create a
- * state the acquisition service cannot describe in one scale value.
- */
+/* One gain for every channel */
 static int ads1299_set_gain(struct ads1299_private *priv, int gain)
 {
 	unsigned int setting;
@@ -579,12 +433,7 @@ static int ads1299_set_gain(struct ads1299_private *priv, int gain)
 	return 0;
 }
 
-/*
- * The MUX applies to every channel at once. A state with one electrode on the
- * patient and the rest on the test generator would produce a record that is
- * part measurement and part stimulus, and nothing downstream could tell which
- * sample was which.
- */
+/* The MUX applies to every channel at once */
 static int ads1299_set_mux(struct ads1299_private *priv, unsigned int mux)
 {
 	unsigned int i;
@@ -627,10 +476,9 @@ static int ads1299_read_one(struct ads1299_private *priv, int chan_index)
 	}
 
 	/*
-	 * At the lowest rate a conversion takes 4 ms; on the USB link the
-	 * round trip adds a bus frame or two. 100 ms is generous for both and
-	 * still short enough that a stuck front-end is reported rather than
-	 * hanging a read of a sysfs file.
+	 * At the lowest rate a conversion takes 4 ms, and a bus behind a bridge
+	 * adds a few more. 100 ms is generous, and short enough that a stuck
+	 * part is reported rather than hanging a sysfs read.
 	 */
 	if (priv->ts_source == ADS1299_TS_HOST_TIMER) {
 		/*
@@ -683,11 +531,7 @@ static int ads1299_set_samp_freq(struct ads1299_private *priv, int val)
 	if (!rate || val <= 0)
 		return -EINVAL;
 
-	/*
-	 * Set membership, not nearest match. Accepting 300 SPS and programming
-	 * 250 would be a configured acquisition rate that silently is not the
-	 * one recorded in the session metadata.
-	 */
+	/* Exact rates only: 300 SPS is refused, not rounded to 250 */
 	factor = (unsigned int)((rate >> ADS1299_SHIFT_DR) / (unsigned int)val);
 	if (!is_power_of_2(factor) ||
 	    (rate >> ADS1299_SHIFT_DR) != (unsigned long)val * factor)
@@ -726,18 +570,9 @@ static int ads1299_get_scale(struct ads1299_private *priv,
 	 * Full scale is +-VREF/gain, so one LSB is VREF/(gain * 2^23),
 	 * reported in millivolts as the IIO ABI requires.
 	 *
-	 * Computed in 64 bits and returned as INT_PLUS_NANO rather than as the
-	 * mainline driver's FRACTIONAL_LOG2 over an integer millivolt full
-	 * scale. That form truncates: 4.5 V over gain 24 is 187.5 mV and
-	 * becomes 187, a 0.27% gain error on every sample, and the ADS1298
-	 * driver has the same shape of loss (4000/24 -> 166). Here the
-	 * resolution is 1 pV, so the 22.3517 nV step is carried to 1.3e-5
-	 * relative - which is the first thing to offer back upstream after the
-	 * timestamp channel.
-	 *
-	 * This value existing in sysfs is a requirement of the architecture and
-	 * not a convenience: nothing in userspace may carry a conversion
-	 * constant for a converter it is not allowed to name.
+	 * Computed in 64 bits and returned as INT_PLUS_NANO: FRACTIONAL_LOG2
+	 * over an integer millivolt full scale would truncate 4.5 V / 24 =
+	 * 187.5 mV to 187, a 0.27% gain error.
 	 */
 	step = (u64)vref_uv * MICRO;
 	step = div_u64(step, (u64)gain << (ADS1299_BITS_PER_SAMPLE - 1));
@@ -919,10 +754,8 @@ static int ads1299_update_scan_mode(struct iio_dev *indio_dev,
  * Device attributes beyond the IIO ABI
  *
  * IIO has no standard ABI for "connect every channel to the internal test
- * generator" or for "which electrodes are detached". These are custom
- * attributes for bench work and for the record, and the fact that they are
- * custom is one of the things to settle before any of this is offered
- * upstream. The self test does NOT depend on them: it runs at probe, below.
+ * generator" or for "which electrodes are detached", so these are custom
+ * attributes. The self test does not depend on them.
  * --------------------------------------------------------------------------
  */
 
@@ -1057,12 +890,7 @@ static ssize_t bias_drive_store(struct device *dev,
 	if (mode < 0)
 		return mode;
 
-	/*
-	 * Not while running. Changing what the amplifier drives into the
-	 * subject halfway through a recording would put two different bias
-	 * configurations in one record with nothing to say where the boundary
-	 * is.
-	 */
+	/* Not while running: the samples would change meaning mid-stream */
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
@@ -1248,9 +1076,8 @@ static void ads1299_rdata_release_busy_or_restart(struct ads1299_private *priv)
 		 */
 		spi_async(priv->spi, &priv->rdata_msg);
 		/*
-		 * More than one means samples were lost. Count them - this is
-		 * the number RESULTS.md §9 is missing - and reset to 1 so the
-		 * handshake resynchronises.
+		 * More than one means samples were lost. Count them and reset
+		 * to 1 so the handshake resynchronises.
 		 */
 		if (priv->rdata_xfer_busy > 2)
 			priv->lost_samples += priv->rdata_xfer_busy - 2;
@@ -1280,13 +1107,9 @@ static void ads1299_rdata_complete(void *context)
 	}
 
 	/*
-	 * Taken here, at SPI completion, and not when the frame is handed to
-	 * userspace. On the hat link that is one SPI transfer after the DRDY
-	 * edge; on the USB link it is one bus frame and one host wakeup after
-	 * the conversion, and no arithmetic in this driver can recover the
-	 * difference. Which of the two produced a record is declared by
-	 * timestamp_source, and carried into the record by the acquisition
-	 * service as acquisition.link.
+	 * Taken at SPI completion: one transfer after the DRDY edge, or, on the
+	 * host timer, one bus round trip after the conversion. timestamp_source
+	 * says which.
 	 */
 	timestamp = iio_get_time_ns(indio_dev);
 
@@ -1331,14 +1154,9 @@ static irqreturn_t ads1299_interrupt(int irq, void *dev_id)
 }
 
 /*
- * The host-timed path, for a link that cannot deliver DRDY.
- *
- * This is deliberately NOT dressed up as equivalent to the interrupt path.
- * The converter still decides when a sample exists; this timer only decides
- * when the host asks for one, so the jitter of the whole link lands in the
- * timestamp. That is the measurement the two links exist to compare
- * (implementation_plan_iio_afe.md §9.4), and hiding it here would delete the
- * result.
+ * The host-timed path, when DRDY is not an interrupt. The converter still
+ * decides when a sample exists; the timer only decides when the host asks for
+ * it, so the bus's jitter lands in the timestamp.
  */
 static enum hrtimer_restart ads1299_timer_fired(struct hrtimer *timer)
 {
@@ -1477,19 +1295,15 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	 * Bias off, written rather than assumed. It is the reset state and the
 	 * register write above already cleared PD_BIAS, but the derivation
 	 * registers are not touched by that write and a part that was left
-	 * configured by something else would keep them. An amplifier that
-	 * drives a subject is not a thing to leave at whatever it was.
+	 * configured by something else would keep them.
 	 */
 	ret = ads1299_set_bias(priv, ADS1299_BIAS_OFF);
 	if (ret)
 		return ret;
 
 	/*
-	 * CHnSET out of reset is gain 24 with the input SHORTED. Leaving that
-	 * alone is how this driver would produce a clean, plausible, entirely
-	 * fictional flat trace, so the MUX is programmed explicitly here. The
-	 * ADS1298 driver has no equivalent line because its reset value is the
-	 * normal input - this is the adaptation most likely to be missed.
+	 * CHnSET out of reset is gain 24 with the input SHORTED, which reads as
+	 * a clean, plausible flat trace, so the MUX is programmed explicitly.
 	 */
 	for (i = 0; i < priv->num_adc_channels; i++) {
 		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(i),
@@ -1503,7 +1317,7 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	/*
 	 * Lead-off comparators powered on. Not the same as lead-off detection
 	 * being enabled: that needs LOFF_SENSP/LOFF_SENSN per channel, which
-	 * nothing here writes - see the note at their definitions.
+	 * nothing here writes.
 	 */
 	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
 				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
@@ -1560,7 +1374,7 @@ static int ads1299_sample_stats(struct ads1299_private *priv, unsigned int count
 }
 
 /*
- * Probe-time self test of the analogue path (IEC 60601-1 §14).
+ * Probe-time self test of the analogue path.
  *
  * Step 1 shorts the inputs and requires the noise floor to be under
  * ADS1299_SELF_TEST_NOISE_UV_PP; the mean it measures is each channel's
@@ -1570,10 +1384,8 @@ static int ads1299_sample_stats(struct ads1299_private *priv, unsigned int count
  * a stuck gain or a broken reference all fall outside it. Both leave the
  * inputs connected and the generator off, pass or fail.
  *
- * A failure fails the probe. The device is never registered, so no userspace
- * can acquire from a front-end that did not pass - and the numbers that failed
- * are in the kernel log, which is the only place that can say why a front-end
- * is absent.
+ * A failure fails the probe, and the numbers that failed go to the kernel
+ * log.
  */
 static int ads1299_self_test(struct ads1299_private *priv)
 {
@@ -1758,11 +1570,8 @@ static int ads1299_probe(struct spi_device *spi)
 		return PTR_ERR(priv->regmap);
 
 	/*
-	 * Which link this is, decided by whether the board could route DRDY to
-	 * an interrupt. On the hat the answer is yes and the timestamp is one
-	 * SPI transfer from the conversion; behind a USB-SPI bridge the answer
-	 * is structurally no - HID delivers no asynchronous interrupt to a host
-	 * at all - and the driver falls back to asking on a timer.
+	 * Without DRDY as an interrupt (behind a USB-SPI bridge, for instance)
+	 * the driver asks for each conversion on a timer.
 	 */
 	priv->ts_source = spi->irq > 0 ? ADS1299_TS_DRDY_IRQ
 				       : ADS1299_TS_HOST_TIMER;
@@ -1831,7 +1640,7 @@ static int ads1299_probe(struct spi_device *spi)
 		return ret;
 
 	/*
-	 * Last, once conversions can complete on either link and before anything
+	 * Last, once conversions can complete on either path and before anything
 	 * can see the device. A front-end that fails is not registered at all -
 	 * userspace finds no device, and the log says why.
 	 */
@@ -1871,5 +1680,5 @@ module_spi_driver(ads1299_driver);
 
 MODULE_AUTHOR("Mike Looijmans <mike.looijmans@topic.nl>");
 MODULE_AUTHOR("Stephan Costa Barros <stephanbrrs8@gmail.com>");
-MODULE_DESCRIPTION("TI ADS1299 biopotential front-end, derived from ti-ads1298");
+MODULE_DESCRIPTION("TI ADS1299 biopotential ADC driver");
 MODULE_LICENSE("GPL");
