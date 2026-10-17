@@ -22,6 +22,15 @@ description: |
   The converter signals a completed conversion on its DRDY output and is read
   over SPI in mode 1 (CPOL=0, CPHA=1).
 
+  Several converters can share one SPI bus in two ways. In cascaded mode each
+  has its own chip select and its own node; one of them can drive its internal
+  oscillator out of its CLK pin (#clock-cells) for the others to use as their
+  external clock. In daisy-chain mode they share the chip select and DIN, the
+  DOUT of each one feeds the DAISY_IN of the one before it, and the chain is a
+  single node with #daisy-chained-devices. A daisy chain shares DIN, so every
+  register write reaches every device: the devices run with one configuration
+  and from one external clock, and the bias drive amplifier cannot be used.
+
   https://www.ti.com/lit/gpn/ads1299
 
 properties:
@@ -55,6 +64,26 @@ properties:
   clock-names:
     const: clk
 
+  '#clock-cells':
+    const: 0
+    description:
+      The CLK pin as a clock output, for a part whose CLKSEL pin selects the
+      internal oscillator. The oscillator is driven out of the pin while a
+      consumer holds the clock prepared, and the pin is high impedance
+      otherwise.
+
+  clock-output-names:
+    maxItems: 1
+
+  '#daisy-chained-devices':
+    description:
+      Number of converters in the daisy chain, all of the type the compatible
+      names. Their channels are reported in chain order, the device whose DOUT
+      reaches the host first.
+    minimum: 1
+    maximum: 8
+    default: 1
+
   avdd-supply:
     description: Analog supply.
 
@@ -74,6 +103,23 @@ required:
 
 allOf:
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
+  - if:
+      required:
+        - '#clock-cells'
+    then:
+      properties:
+        clocks: false
+  - if:
+      required:
+        - '#daisy-chained-devices'
+      properties:
+        '#daisy-chained-devices':
+          minimum: 2
+    then:
+      required:
+        - clocks
+      properties:
+        '#clock-cells': false
 
 unevaluatedProperties: false
 
@@ -95,5 +141,54 @@ examples:
             interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
             reset-gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
             avdd-supply = <&reg_avdd>;
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    /* Cascaded: the first converter clocks the second */
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        adc0: adc@0 {
+            compatible = "ti,ads1299";
+            reg = <0>;
+            spi-cpha;
+            interrupt-parent = <&gpio1>;
+            interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+            avdd-supply = <&reg_avdd>;
+            #clock-cells = <0>;
+        };
+
+        adc@1 {
+            compatible = "ti,ads1299";
+            reg = <1>;
+            spi-cpha;
+            interrupt-parent = <&gpio1>;
+            interrupts = <6 IRQ_TYPE_EDGE_FALLING>;
+            avdd-supply = <&reg_avdd>;
+            clocks = <&adc0>;
+            clock-names = "clk";
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    /* Daisy chain: three converters, 24 channels, one chip select */
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        adc@0 {
+            compatible = "ti,ads1299";
+            reg = <0>;
+            spi-cpha;
+            interrupt-parent = <&gpio1>;
+            interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+            avdd-supply = <&reg_avdd>;
+            clocks = <&osc_2048k>;
+            clock-names = "clk";
+            #daisy-chained-devices = <3>;
         };
     };
