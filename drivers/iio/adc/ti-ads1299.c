@@ -43,6 +43,7 @@
 
 #include <linux/iio/iio.h>
 #include <linux/iio/buffer.h>
+#include <linux/iio/events.h>
 #include <linux/iio/kfifo_buf.h>
 #include <linux/iio/sysfs.h>
 
@@ -225,9 +226,14 @@ static const char * const ads1299_bias_names[] = {
 /* A command takes 4 t_CLK to decode, so register access runs at f_CLK */
 #define ADS1299_SPI_BUS_SPEED_SLOW		ADS1299_CLK_RATE_HZ
 #define ADS1299_SPI_CMD_BUFFER_SIZE		3
-/* [SBAS499 9.4.4.2] The status word opens with 1100b */
+/*
+ * [SBAS499 9.4.4.2] The status word opens with 1100b, then LOFF_STATP,
+ * LOFF_STATN and GPIO[7:4]. Its offset in the RDATA reply is the address of
+ * the buffer channel that carries each conversion's lead-off state.
+ */
 #define ADS1299_MASK_STATUS_SYNC		GENMASK(7, 4)
 #define ADS1299_STATUS_SYNC			0xc0
+#define ADS1299_LEAD_OFF_ADDRESS		1
 
 /* Command byte, status word and n 24-bit samples */
 #define ADS1299_SPI_RDATA_BUFFER_SIZE(n)	(((n) + 1) * 3 + 1)
@@ -292,6 +298,19 @@ struct ads1299_private {
 	/* Number of ADC channels the chip reported; excludes the timestamp */
 	unsigned int num_adc_channels;
 	enum ads1299_bias bias;
+	/*
+	 * What lead-off is read with at each conversion, kept here for the SPI
+	 * completion, which runs where the regmap's lock cannot be taken: the
+	 * inputs sensed, whether the excitation is AC (the comparators then
+	 * report nothing), whether a fault raises an event, and which inputs
+	 * were off at the last conversion.
+	 */
+	u8 loff_sensp;
+	u8 loff_sensn;
+	bool loff_ac;
+	bool loff_events;
+	u8 loff_offp;
+	u8 loff_offn;
 
 	enum ads1299_timestamp_source ts_source;
 	struct hrtimer timer;		/* only used when ts_source is HOST_TIMER */
@@ -300,7 +319,7 @@ struct ads1299_private {
 
 	/* Demux target. Must stay 8-byte aligned for the timestamp channel. */
 	struct {
-		u32 chan[ADS1299_MAX_CHANNELS];
+		u32 chan[ADS1299_MAX_CHANNELS + 1];	/* + lead-off word */
 		s64 timestamp __aligned(8);
 	} scan;
 
@@ -341,6 +360,30 @@ static int ads1299_update_loff_comparators(struct ads1299_private *priv)
 	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
 				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
 				  on ? ADS1299_MASK_CONFIG4_PD_LOFF_COMP : 0);
+}
+
+/* The copies of the lead-off configuration the SPI completion reads */
+static int ads1299_cache_loff(struct ads1299_private *priv)
+{
+	unsigned int sensp;
+	unsigned int sensn;
+	unsigned int loff;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSP, &sensp);
+	if (!ret)
+		ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSN, &sensn);
+	if (!ret)
+		ret = regmap_read(priv->regmap, ADS1299_REG_LOFF, &loff);
+	if (ret)
+		return ret;
+
+	priv->loff_sensp = sensp;
+	priv->loff_sensn = sensn;
+	priv->loff_ac = FIELD_GET(ADS1299_MASK_LOFF_FLEAD_OFF, loff) !=
+			ADS1299_LOFF_FLEAD_OFF_DC;
+
+	return 0;
 }
 
 /*
@@ -394,6 +437,8 @@ static ssize_t ads1299_loff_channel_write(struct iio_dev *indio_dev,
 				 on ? BIT(chan->channel) : 0);
 	if (!ret && reg != ADS1299_REG_LOFF_FLIP)
 		ret = ads1299_update_loff_comparators(priv);
+	if (!ret)
+		ret = ads1299_cache_loff(priv);
 
 	iio_device_release_direct_mode(indio_dev);
 
@@ -425,6 +470,19 @@ static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 	{ }
 };
 
+/*
+ * An electrode that comes off, either input of its channel, as the status
+ * word of a conversion reports it: so only while the buffer runs, and never
+ * with AC excitation, where the comparators are not the sensing.
+ */
+static const struct iio_event_spec ads1299_events[] = {
+	{
+		.type = IIO_EV_TYPE_FAULT,
+		.dir = IIO_EV_DIR_FAULT_OPENWIRE,
+		.mask_shared_by_all = BIT(IIO_EV_INFO_ENABLE),
+	},
+};
+
 #define ADS1299_CHAN(index)				\
 {							\
 	.type = IIO_VOLTAGE,				\
@@ -441,6 +499,8 @@ static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 		BIT(IIO_CHAN_INFO_SAMP_FREQ) |		\
 		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
 	.ext_info = ads1299_ext_info,			\
+	.event_spec = ads1299_events,			\
+	.num_event_specs = ARRAY_SIZE(ads1299_events),	\
 	.scan_index = index,				\
 	.scan_type = {					\
 		.sign = 's',				\
@@ -1441,6 +1501,8 @@ static ssize_t ads1299_loff_store(struct device *dev,
 
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_LOFF, mask,
 				 ((unsigned int)code << __ffs(mask)) & mask);
+	if (!ret)
+		ret = ads1299_cache_loff(priv);
 
 	iio_device_release_direct_mode(indio_dev);
 
@@ -1531,11 +1593,41 @@ static const struct attribute_group ads1299_attribute_group = {
 	.attrs = ads1299_attributes,
 };
 
+static int ads1299_read_event_config(struct iio_dev *indio_dev,
+				     const struct iio_chan_spec *chan,
+				     enum iio_event_type type,
+				     enum iio_event_direction dir)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+
+	if (type != IIO_EV_TYPE_FAULT)
+		return -EINVAL;
+
+	return priv->loff_events;
+}
+
+static int ads1299_write_event_config(struct iio_dev *indio_dev,
+				      const struct iio_chan_spec *chan,
+				      enum iio_event_type type,
+				      enum iio_event_direction dir, int state)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+
+	if (type != IIO_EV_TYPE_FAULT)
+		return -EINVAL;
+
+	priv->loff_events = state;
+
+	return 0;
+}
+
 static const struct iio_info ads1299_info = {
 	.read_raw = &ads1299_read_raw,
 	.read_avail = &ads1299_read_avail,
 	.write_raw = &ads1299_write_raw,
 	.update_scan_mode = &ads1299_update_scan_mode,
+	.read_event_config = &ads1299_read_event_config,
+	.write_event_config = &ads1299_write_event_config,
 	.debugfs_reg_access = &ads1299_reg_access,
 	.attrs = &ads1299_attribute_group,
 };
@@ -1563,6 +1655,49 @@ static void ads1299_rdata_release_busy_or_restart(struct ads1299_private *priv)
 	}
 }
 
+/*
+ * The inputs off at this conversion, from its status word. A bit is valid
+ * only where its input is sensed [SBAS499 9.3.2.4.3], and only with DC
+ * excitation; the rest are cleared here and never reach userspace.
+ */
+static void ads1299_lead_off_state(const struct ads1299_private *priv,
+				   u8 *offp, u8 *offn)
+{
+	const u8 *status = priv->rx_buffer + ADS1299_LEAD_OFF_ADDRESS;
+
+	if (priv->loff_ac) {
+		*offp = 0;
+		*offn = 0;
+		return;
+	}
+
+	*offp = (u8)((status[0] << 4) | (status[1] >> 4)) & priv->loff_sensp;
+	*offn = (u8)((status[1] << 4) | (status[2] >> 4)) & priv->loff_sensn;
+}
+
+/* An event for each channel with an input newly off */
+static void ads1299_lead_off_events(struct iio_dev *indio_dev, u8 offp, u8 offn,
+				    s64 timestamp)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned long newly = (offp & ~priv->loff_offp) |
+			      (offn & ~priv->loff_offn);
+	unsigned int bit;
+
+	priv->loff_offp = offp;
+	priv->loff_offn = offn;
+
+	if (!priv->loff_events)
+		return;
+
+	for_each_set_bit(bit, &newly, priv->num_adc_channels)
+		iio_push_event(indio_dev,
+			       IIO_UNMOD_EVENT_CODE(IIO_VOLTAGE, bit,
+						    IIO_EV_TYPE_FAULT,
+						    IIO_EV_DIR_FAULT_OPENWIRE),
+			       timestamp);
+}
+
 /* Called from SPI completion interrupt handler */
 static void ads1299_rdata_complete(void *context)
 {
@@ -1571,6 +1706,8 @@ static void ads1299_rdata_complete(void *context)
 	int scan_index;
 	u32 *bounce = priv->scan.chan;
 	s64 timestamp;
+	u8 offp;
+	u8 offn;
 
 	if (!iio_buffer_enabled(indio_dev)) {
 		/*
@@ -1589,6 +1726,9 @@ static void ads1299_rdata_complete(void *context)
 	 */
 	timestamp = iio_get_time_ns(indio_dev);
 
+	ads1299_lead_off_state(priv, &offp, &offn);
+	ads1299_lead_off_events(indio_dev, offp, offn, timestamp);
+
 	for_each_set_bit(scan_index, indio_dev->active_scan_mask,
 			 indio_dev->masklength) {
 		const struct iio_chan_spec *scan_chan =
@@ -1597,6 +1737,12 @@ static void ads1299_rdata_complete(void *context)
 
 		if (scan_chan->type == IIO_TIMESTAMP)
 			continue;
+
+		/* (positive << 8) | negative, bit n for channel n + 1 */
+		if (scan_chan->address == ADS1299_LEAD_OFF_ADDRESS) {
+			*bounce++ = ((u32)offp << 8) | offn;
+			continue;
+		}
 
 		data = priv->rx_buffer + scan_chan->address;
 		*bounce++ = get_unaligned_be24(data);
@@ -1651,6 +1797,9 @@ static int ads1299_buffer_postenable(struct iio_dev *indio_dev)
 	int ret;
 
 	priv->lost_samples = 0;
+	/* An electrode already off raises its event at the first conversion */
+	priv->loff_offp = 0;
+	priv->loff_offn = 0;
 
 	/* Disable single-shot mode */
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
@@ -1930,7 +2079,11 @@ static int ads1299_init(struct iio_dev *indio_dev)
 			return ret;
 	}
 
-	return ads1299_update_loff_comparators(priv);
+	ret = ads1299_update_loff_comparators(priv);
+	if (ret)
+		return ret;
+
+	return ads1299_cache_loff(priv);
 }
 
 /*
@@ -2113,16 +2266,36 @@ static int ads1299_build_channels(struct iio_dev *indio_dev,
 	struct iio_chan_spec *channels;
 	unsigned int n = priv->num_adc_channels;
 
-	/* n voltage channels plus one timestamp */
-	channels = devm_kcalloc(dev, n + 1, sizeof(*channels), GFP_KERNEL);
+	/* n voltage channels, the lead-off word, and a timestamp */
+	channels = devm_kcalloc(dev, n + 2, sizeof(*channels), GFP_KERNEL);
 	if (!channels)
 		return -ENOMEM;
 
 	memcpy(channels, ads1299_channels, n * sizeof(*channels));
-	channels[n] = (struct iio_chan_spec)IIO_CHAN_SOFT_TIMESTAMP(n);
+	/*
+	 * in_voltageN_lead_off in the scan elements: each conversion's
+	 * lead-off state, (positive << 8) | negative. The type is the only one
+	 * the core has for a channel in a voltage converter's buffer; the name,
+	 * and no _raw or _scale, are what say it is not a voltage.
+	 */
+	channels[n] = (struct iio_chan_spec){
+		.type = IIO_VOLTAGE,
+		.indexed = 1,
+		.channel = (int)n,
+		.extend_name = "lead_off",
+		.address = ADS1299_LEAD_OFF_ADDRESS,
+		.scan_index = (int)n,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 16,
+			.storagebits = 32,
+			.endianness = IIO_CPU,
+		},
+	};
+	channels[n + 1] = (struct iio_chan_spec)IIO_CHAN_SOFT_TIMESTAMP(n + 1);
 
 	indio_dev->channels = channels;
-	indio_dev->num_channels = (int)(n + 1);
+	indio_dev->num_channels = (int)(n + 2);
 
 	return 0;
 }
