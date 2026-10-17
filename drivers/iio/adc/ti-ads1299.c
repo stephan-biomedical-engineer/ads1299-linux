@@ -108,8 +108,7 @@
 /*
  * [SBAS499 Table 15] CONFIG3, reset 0x60. Reserved bits 6:5 are always 3h.
  * PWR_REFBUF is the datasheet's PD_REFBUF, renamed because 1 powers the buffer
- * up. BIAS_STAT is read-only, and CONFIG3 is cached: reading it needs the
- * register in the volatile table.
+ * up. BIAS_STAT is read-only, which is why CONFIG3 is a volatile register.
  */
 #define ADS1299_REG_CONFIG3			0x03
 #define ADS1299_MASK_CONFIG3_PWR_REFBUF		BIT(7)
@@ -1148,6 +1147,90 @@ static ssize_t lead_off_status_show(struct device *dev,
 	return sysfs_emit(buf, "%02x %02x\n", statp & sensp, statn & sensn);
 }
 
+/*
+ * Lead-off of the bias electrode [SBAS499 9.3.2.4.4]. With the bias drive off,
+ * BIAS_LOFF_SENS drives the lead-off current into the electrode and a
+ * comparator reports in BIAS_STAT whether it is connected. With the drive on
+ * the current source does nothing, and the comparator watches the amplifier's
+ * output against the COMP_TH thresholds instead. BIAS_STAT means nothing with
+ * the sensing off.
+ */
+static const char * const ads1299_bias_lead_off_names[] = { "off", "on" };
+
+static ssize_t bias_lead_off_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	bool on;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG3, &regval);
+	if (ret)
+		return ret;
+
+	on = regval & ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS;
+
+	return sysfs_emit(buf, "%s\n", ads1299_bias_lead_off_names[on]);
+}
+
+static ssize_t bias_lead_off_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	int on;
+	int ret;
+
+	on = sysfs_match_string(ads1299_bias_lead_off_names, buf);
+	if (on < 0)
+		return on;
+
+	/* Not while running: the lead-off current changes what is measured */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	/* The comparators first: BIAS_STAT is one of their outputs */
+	ret = 0;
+	if (on)
+		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
+					 ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
+					 ADS1299_MASK_CONFIG4_PD_LOFF_COMP);
+	if (!ret)
+		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+					 ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS,
+					 on ? ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS : 0);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t bias_lead_off_status_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	int ret;
+
+	/* CONFIG3 is volatile: this reaches the part */
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG3, &regval);
+	if (ret)
+		return ret;
+
+	if (!(regval & ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS))
+		return sysfs_emit(buf, "disabled\n");
+
+	return sysfs_emit(buf, "%s\n",
+			  regval & ADS1299_MASK_CONFIG3_BIAS_STAT ?
+				  "disconnected" : "connected");
+}
+
 static ssize_t lost_samples_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1175,6 +1258,8 @@ static IIO_DEVICE_ATTR_RO(test_signal_available, 0);
 static IIO_DEVICE_ATTR_RW(bias_drive, 0);
 static IIO_DEVICE_ATTR_RO(bias_drive_available, 0);
 static IIO_DEVICE_ATTR_RO(lead_off_status, 0);
+static IIO_DEVICE_ATTR_RW(bias_lead_off, 0);
+static IIO_DEVICE_ATTR_RO(bias_lead_off_status, 0);
 static IIO_DEVICE_ATTR_RO(lost_samples, 0);
 static IIO_DEVICE_ATTR_RO(timestamp_source, 0);
 
@@ -1186,6 +1271,8 @@ static struct attribute *ads1299_attributes[] = {
 	&iio_dev_attr_bias_drive.dev_attr.attr,
 	&iio_dev_attr_bias_drive_available.dev_attr.attr,
 	&iio_dev_attr_lead_off_status.dev_attr.attr,
+	&iio_dev_attr_bias_lead_off.dev_attr.attr,
+	&iio_dev_attr_bias_lead_off_status.dev_attr.attr,
 	&iio_dev_attr_lost_samples.dev_attr.attr,
 	&iio_dev_attr_timestamp_source.dev_attr.attr,
 	NULL
@@ -1379,7 +1466,9 @@ static int ads1299_get_optional_supply(struct device *dev, const char *id,
 	return devm_add_action_or_reset(dev, ads1299_reg_disable, *reg);
 }
 
+/* CONFIG3 for BIAS_STAT, its one status bit; a write cannot set it */
 static const struct regmap_range ads1299_regmap_volatile_range[] = {
+	regmap_reg_range(ADS1299_REG_CONFIG3, ADS1299_REG_CONFIG3),
 	regmap_reg_range(ADS1299_REG_LOFF_STATP, ADS1299_REG_LOFF_STATN),
 };
 
