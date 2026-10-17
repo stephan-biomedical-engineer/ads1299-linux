@@ -444,6 +444,169 @@ static ssize_t ads1299_channel_bit_write(struct iio_dev *indio_dev,
 	return ret ? ret : (ssize_t)len;
 }
 
+static const char * const ads1299_mux_names[] = {
+	[ADS1299_MUX_NORMAL]		= "normal",
+	[ADS1299_MUX_SHORTED]		= "shorted",
+	[ADS1299_MUX_BIAS_MEAS]		= "bias_measurement",
+	[ADS1299_MUX_MVDD]		= "supply",
+	[ADS1299_MUX_TEMPERATURE]	= "temperature",
+	[ADS1299_MUX_TEST_SIGNAL]	= "test_signal",
+	[ADS1299_MUX_BIAS_DRP]		= "bias_drive_p",
+	[ADS1299_MUX_BIAS_DRN]		= "bias_drive_n",
+};
+
+/* Whether any channel's MUX is at this setting */
+static int ads1299_mux_in_use(struct ads1299_private *priv, unsigned int mux)
+{
+	unsigned int regval;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < priv->num_adc_channels; i++) {
+		ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(i), &regval);
+		if (ret)
+			return ret;
+		if (FIELD_GET(ADS1299_MASK_CH_MUX, regval) == mux)
+			return 1;
+	}
+
+	return 0;
+}
+
+static int ads1299_generator_on(struct ads1299_private *priv)
+{
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG2, &regval);
+	if (ret)
+		return ret;
+
+	return !!(regval & ADS1299_MASK_CONFIG2_INT_CAL);
+}
+
+/*
+ * MUX = 010 measures BIASIN only with CONFIG3.BIAS_MEAS set [SBAS499 Table
+ * 15], so the bit follows the MUX: set before a channel moves there, cleared
+ * after the last one has left.
+ */
+static int ads1299_set_bias_meas(struct ads1299_private *priv, bool on)
+{
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+				  ADS1299_MASK_CONFIG3_BIAS_MEAS,
+				  on ? ADS1299_MASK_CONFIG3_BIAS_MEAS : 0);
+}
+
+/* What one channel is connected to [SBAS499 Table 17] */
+static int ads1299_set_mux(struct ads1299_private *priv, unsigned int channel,
+			   unsigned int mux)
+{
+	int ret;
+
+	if (mux == ADS1299_MUX_BIAS_MEAS) {
+		ret = ads1299_set_bias_meas(priv, true);
+		if (ret)
+			return ret;
+	}
+
+	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(channel),
+				 ADS1299_MASK_CH_MUX,
+				 FIELD_PREP(ADS1299_MASK_CH_MUX, mux));
+	if (ret || mux == ADS1299_MUX_BIAS_MEAS)
+		return ret;
+
+	ret = ads1299_mux_in_use(priv, ADS1299_MUX_BIAS_MEAS);
+	if (ret < 0)
+		return ret;
+
+	return ret ? 0 : ads1299_set_bias_meas(priv, false);
+}
+
+/* Every channel to one setting: the self test's shorted and test inputs */
+static int ads1299_set_mux_all(struct ads1299_private *priv, unsigned int mux)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < priv->num_adc_channels; i++) {
+		ret = ads1299_set_mux(priv, i, mux);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * input_mux per channel. The test input with the generator off reads an
+ * internal node that nothing drives - this part has no external test pin - so
+ * a channel is refused the test input while the generator is off, and
+ * test_signal refuses "off" while any channel is on it. Both hold direct
+ * mode, which also orders them against each other.
+ */
+static ssize_t ads1299_mux_read(struct iio_dev *indio_dev, uintptr_t private,
+				const struct iio_chan_spec *chan, char *buf)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(chan->channel),
+			  &regval);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%s\n",
+			  ads1299_mux_names[FIELD_GET(ADS1299_MASK_CH_MUX,
+						      regval)]);
+}
+
+static ssize_t ads1299_mux_write(struct iio_dev *indio_dev, uintptr_t private,
+				 const struct iio_chan_spec *chan,
+				 const char *buf, size_t len)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	int mux;
+	int ret;
+
+	mux = sysfs_match_string(ads1299_mux_names, buf);
+	if (mux < 0)
+		return mux;
+
+	/* Not while running: the channel's samples would change meaning */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = 0;
+	if (mux == ADS1299_MUX_TEST_SIGNAL) {
+		ret = ads1299_generator_on(priv);
+		if (!ret)
+			ret = -EINVAL;
+	}
+	if (ret >= 0)
+		ret = ads1299_set_mux(priv, chan->channel, mux);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static ssize_t ads1299_mux_available(struct iio_dev *indio_dev,
+				     uintptr_t private,
+				     const struct iio_chan_spec *chan,
+				     char *buf)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ads1299_mux_names); i++)
+		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
+				     ads1299_mux_names[i]);
+
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+
 /*
  * SRB2 [SBAS499 Table 17, Figure 18]: closes a switch between the SRB2 pin
  * and this channel's positive input.
@@ -527,6 +690,17 @@ static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
 		.private = 4,
 	},
 	{
+		.name = "input_mux",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_mux_read,
+		.write = ads1299_mux_write,
+	},
+	{
+		.name = "input_mux_available",
+		.shared = IIO_SHARED_BY_TYPE,
+		.read = ads1299_mux_available,
+	},
+	{
 		.name = "srb2",
 		.shared = IIO_SEPARATE,
 		.read = ads1299_srb2_read,
@@ -598,17 +772,6 @@ static const int ads1299_samp_freq_avail[] = {
  */
 static const int ads1299_pga_gain[] = { 1, 2, 4, 6, 8, 12, 24 };
 
-static const char * const ads1299_mux_names[] = {
-	[ADS1299_MUX_NORMAL]		= "normal",
-	[ADS1299_MUX_SHORTED]		= "shorted",
-	[ADS1299_MUX_BIAS_MEAS]		= "bias_measurement",
-	[ADS1299_MUX_MVDD]		= "supply",
-	[ADS1299_MUX_TEMPERATURE]	= "temperature",
-	[ADS1299_MUX_TEST_SIGNAL]	= "test_signal",
-	[ADS1299_MUX_BIAS_DRP]		= "bias_drive_p",
-	[ADS1299_MUX_BIAS_DRN]		= "bias_drive_n",
-};
-
 static int ads1299_write_cmd(struct ads1299_private *priv, u8 command)
 {
 	struct spi_transfer xfer = {
@@ -669,42 +832,6 @@ static int ads1299_set_gain(struct ads1299_private *priv, unsigned int channel,
 	return regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(channel),
 				  ADS1299_MASK_CH_PGA,
 				  FIELD_PREP(ADS1299_MASK_CH_PGA, setting));
-}
-
-/* The MUX applies to every channel at once */
-/*
- * MUX = 010 measures BIASIN only with CONFIG3.BIAS_MEAS set [SBAS499 Table
- * 15], so the bit follows the MUX: set before a channel moves there, cleared
- * after the last one has left.
- */
-static int ads1299_set_bias_meas(struct ads1299_private *priv, bool on)
-{
-	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
-				  ADS1299_MASK_CONFIG3_BIAS_MEAS,
-				  on ? ADS1299_MASK_CONFIG3_BIAS_MEAS : 0);
-}
-
-static int ads1299_set_mux(struct ads1299_private *priv, unsigned int mux)
-{
-	bool bias_meas = mux == ADS1299_MUX_BIAS_MEAS;
-	unsigned int i;
-	int ret;
-
-	if (bias_meas) {
-		ret = ads1299_set_bias_meas(priv, true);
-		if (ret)
-			return ret;
-	}
-
-	for (i = 0; i < priv->num_adc_channels; i++) {
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CHnSET(i),
-					 ADS1299_MASK_CH_MUX,
-					 FIELD_PREP(ADS1299_MASK_CH_MUX, mux));
-		if (ret)
-			return ret;
-	}
-
-	return bias_meas ? 0 : ads1299_set_bias_meas(priv, false);
 }
 
 static int ads1299_read_one(struct ads1299_private *priv, int chan_index)
@@ -1017,113 +1144,11 @@ static int ads1299_update_scan_mode(struct iio_dev *indio_dev,
 /* --------------------------------------------------------------------------
  * Device attributes beyond the IIO ABI
  *
- * IIO has no standard ABI for "connect every channel to the internal test
- * generator" or for "which electrodes are detached", so these are custom
- * attributes. The self test does not depend on them.
+ * IIO has no standard ABI for the internal test generator or for which
+ * electrodes are detached, so these are custom attributes. The self test does
+ * not depend on them.
  * --------------------------------------------------------------------------
  */
-
-static ssize_t input_mux_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct ads1299_private *priv = iio_priv(indio_dev);
-	unsigned int regval;
-	unsigned int mux;
-	int ret;
-
-	ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(0), &regval);
-	if (ret)
-		return ret;
-
-	mux = FIELD_GET(ADS1299_MASK_CH_MUX, regval);
-
-	return sysfs_emit(buf, "%s\n", ads1299_mux_names[mux]);
-}
-
-/*
- * The test input with the generator off reads an internal node that nothing
- * drives: this part has no external test pin. A channel is never left there,
- * so input_mux refuses the test input while the generator is off, and
- * test_signal refuses "off" while any channel is on the test input. Both
- * stores hold direct mode, which also orders them against each other.
- */
-static int ads1299_test_input_selected(struct ads1299_private *priv)
-{
-	unsigned int regval;
-	unsigned int i;
-	int ret;
-
-	for (i = 0; i < priv->num_adc_channels; i++) {
-		ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(i), &regval);
-		if (ret)
-			return ret;
-		if (FIELD_GET(ADS1299_MASK_CH_MUX, regval) ==
-		    ADS1299_MUX_TEST_SIGNAL)
-			return 1;
-	}
-
-	return 0;
-}
-
-static int ads1299_generator_on(struct ads1299_private *priv)
-{
-	unsigned int regval;
-	int ret;
-
-	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG2, &regval);
-	if (ret)
-		return ret;
-
-	return !!(regval & ADS1299_MASK_CONFIG2_INT_CAL);
-}
-
-static ssize_t input_mux_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t len)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct ads1299_private *priv = iio_priv(indio_dev);
-	int mux;
-	int ret;
-
-	mux = sysfs_match_string(ads1299_mux_names, buf);
-	if (mux < 0)
-		return mux;
-
-	/* Not while running: every sample would change meaning */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
-
-	if (mux == ADS1299_MUX_TEST_SIGNAL) {
-		ret = ads1299_generator_on(priv);
-		if (!ret)
-			ret = -EINVAL;
-	}
-	if (ret >= 0)
-		ret = ads1299_set_mux(priv, (unsigned int)mux);
-
-	iio_device_release_direct_mode(indio_dev);
-
-	return ret ? ret : (ssize_t)len;
-}
-
-static ssize_t input_mux_available_show(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	size_t len = 0;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(ads1299_mux_names); i++)
-		len += sysfs_emit_at(buf, len, "%s%s", i ? " " : "",
-				     ads1299_mux_names[i]);
-
-	len += sysfs_emit_at(buf, len, "\n");
-
-	return (ssize_t)len;
-}
 
 /*
  * Power the bias amplifier up or down. BIASREF_INT travels with it and not
@@ -1288,7 +1313,7 @@ static ssize_t test_signal_store(struct device *dev,
 
 	ret = 0;
 	if (!(ads1299_test_signals[i].config2 & ADS1299_MASK_CONFIG2_INT_CAL)) {
-		ret = ads1299_test_input_selected(priv);
+		ret = ads1299_mux_in_use(priv, ADS1299_MUX_TEST_SIGNAL);
 		if (ret > 0)
 			ret = -EINVAL;
 	}
@@ -1651,8 +1676,6 @@ static ssize_t timestamp_source_show(struct device *dev,
 				  "drdy_irq" : "host_timer");
 }
 
-static IIO_DEVICE_ATTR_RW(input_mux, 0);
-static IIO_DEVICE_ATTR_RO(input_mux_available, 0);
 static IIO_DEVICE_ATTR_RW(test_signal, 0);
 static IIO_DEVICE_ATTR_RO(test_signal_available, 0);
 static IIO_DEVICE_ATTR_RW(bias_drive, 0);
@@ -1678,8 +1701,6 @@ static IIO_DEVICE_ATTR_RO(lost_samples, 0);
 static IIO_DEVICE_ATTR_RO(timestamp_source, 0);
 
 static struct attribute *ads1299_attributes[] = {
-	&iio_dev_attr_input_mux.dev_attr.attr,
-	&iio_dev_attr_input_mux_available.dev_attr.attr,
 	&iio_dev_attr_test_signal.dev_attr.attr,
 	&iio_dev_attr_test_signal_available.dev_attr.attr,
 	&iio_dev_attr_bias_drive.dev_attr.attr,
@@ -2287,6 +2308,8 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	s32 level[ADS1299_MAX_CHANNELS];
 	s32 pp[ADS1299_MAX_CHANNELS];
 	int gain[ADS1299_MAX_CHANNELS];
+	unsigned int mux[ADS1299_MAX_CHANNELS];
+	unsigned int regval;
 	s32 noise_pp = 0;
 	u64 expected;
 	u64 window;
@@ -2301,18 +2324,23 @@ static int ads1299_self_test(struct ads1299_private *priv)
 	if (vref_uv <= 0)
 		return vref_uv < 0 ? vref_uv : -EINVAL;
 
-	/* Each channel is judged at its own gain */
+	/* Each channel is judged at its own gain, and goes back to its input */
 	for (ch = 0; ch < priv->num_adc_channels; ch++) {
 		gain[ch] = ads1299_get_gain(priv, ch);
 		if (gain[ch] < 0)
 			return gain[ch];
+		ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(ch),
+				  &regval);
+		if (ret)
+			return ret;
+		mux[ch] = FIELD_GET(ADS1299_MASK_CH_MUX, regval);
 	}
 
 	/* Step 1 - inputs shorted, generator off: noise and offset */
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
 			   ADS1299_CONFIG2_RESERVED_VALUE);
 	if (!ret)
-		ret = ads1299_set_mux(priv, ADS1299_MUX_SHORTED);
+		ret = ads1299_set_mux_all(priv, ADS1299_MUX_SHORTED);
 	if (!ret)
 		ret = ads1299_sample_stats(priv, ADS1299_SELF_TEST_READINGS,
 					   offset, pp);
@@ -2338,7 +2366,7 @@ static int ads1299_self_test(struct ads1299_private *priv)
 				   FIELD_PREP(ADS1299_MASK_CONFIG2_CAL_FREQ,
 					      ADS1299_CAL_FREQ_DC));
 	if (!ret)
-		ret = ads1299_set_mux(priv, ADS1299_MUX_TEST_SIGNAL);
+		ret = ads1299_set_mux_all(priv, ADS1299_MUX_TEST_SIGNAL);
 	if (!ret)
 		ret = ads1299_sample_stats(priv, ADS1299_SELF_TEST_READINGS,
 					   level, pp);
@@ -2356,11 +2384,13 @@ static int ads1299_self_test(struct ads1299_private *priv)
 		}
 	}
 
-	/* Pass or fail, the inputs go back to the electrodes */
-	restore = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-			       ADS1299_CONFIG2_RESERVED_VALUE);
+	/* Pass or fail, every channel goes back to what it was connected to */
+	restore = 0;
+	for (ch = 0; !restore && ch < priv->num_adc_channels; ch++)
+		restore = ads1299_set_mux(priv, ch, mux[ch]);
 	if (!restore)
-		restore = ads1299_set_mux(priv, ADS1299_MUX_NORMAL);
+		restore = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
+				       ADS1299_CONFIG2_RESERVED_VALUE);
 
 	if (ret)
 		return ret;
