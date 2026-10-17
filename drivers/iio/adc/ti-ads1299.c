@@ -251,8 +251,28 @@ static const char * const ads1299_bias_names[] = { "off", "on" };
 #define ADS1299_SELF_TEST_NOISE_UV_PP		10
 #define ADS1299_SELF_TEST_READINGS		10
 /* Conversions right after a MUX change carry its transient */
-#define ADS1299_SELF_TEST_DISCARD		2
+#define ADS1299_MUX_DISCARD			2
 #define ADS1299_SELF_TEST_INTERVAL_MS		50
+
+/*
+ * [SBAS499 9.3.1.1.3, Equation 3] The temperature sensor reads 145300 uV at
+ * 25 degC and moves 490 uV per degC. The datasheet gives no gain to read it at;
+ * it is read at gain 1, where one code is about 0.0011 degC, and no gain can
+ * saturate it.
+ */
+#define ADS1299_TEMP_UV_AT_25C			145300
+#define ADS1299_TEMP_UV_PER_C			490
+
+/*
+ * [SBAS499 9.3.1.1.4] With MUX = 011 a channel reads a supply: 0.5 x (AVDD +
+ * AVSS) on channels 1, 2 and 5 to 8, DVDD / 4 on channels 3 and 4, at gain 1
+ * so as not to saturate the PGA. The driver reports the voltage measured and
+ * infers no supply from it. These are the channels it borrows for that and
+ * for the temperature.
+ */
+#define ADS1299_TEMP_CHANNEL			0
+#define ADS1299_MVDD_ANALOG_CHANNEL		0
+#define ADS1299_MVDD_DIGITAL_CHANNEL		2
 
 /* Internal reference, used when no "vref" regulator is given */
 #define ADS1299_INTERNAL_VREF_UV		4500000
@@ -946,20 +966,23 @@ static int ads1299_set_samp_freq(struct ads1299_private *priv, int val)
 	return 0;
 }
 
-static int ads1299_get_scale(struct ads1299_private *priv,
-			     int channel, int *val, int *val2)
+/* The 24-bit code at an offset of the last RDATA reply */
+static int ads1299_code(const struct ads1299_private *priv,
+			unsigned long address)
+{
+	return sign_extend32(get_unaligned_be24(priv->rx_buffer + address),
+			     ADS1299_BITS_PER_SAMPLE - 1);
+}
+
+static int ads1299_scale_at_gain(struct ads1299_private *priv, int gain,
+				 int *val, int *val2)
 {
 	u64 step;
 	int vref_uv;
-	int gain;
 
 	vref_uv = ads1299_get_vref_uv(priv);
 	if (vref_uv < 0)
 		return vref_uv;
-
-	gain = ads1299_get_gain(priv, (unsigned int)channel);
-	if (gain < 0)
-		return gain;
 
 	/*
 	 * Full scale is +-VREF/gain, so one LSB is VREF/(gain * 2^23),
@@ -978,6 +1001,97 @@ static int ads1299_get_scale(struct ads1299_private *priv,
 	return IIO_VAL_INT_PLUS_NANO;
 }
 
+static int ads1299_get_scale(struct ads1299_private *priv,
+			     int channel, int *val, int *val2)
+{
+	int gain;
+
+	gain = ads1299_get_gain(priv, (unsigned int)channel);
+	if (gain < 0)
+		return gain;
+
+	return ads1299_scale_at_gain(priv, gain, val, val2);
+}
+
+/*
+ * The temperature in millidegrees is (raw + offset) * scale, from Equation 3
+ * at gain 1, where a code is VREF / 2^23:
+ *   scale  = VREF * 1000 / (490 * 2^23)		mdegC per code
+ *   offset = -(145300 - 25 * 490) * 2^23 / VREF	codes
+ */
+static int ads1299_temp_scale(struct ads1299_private *priv, int *val, int *val2)
+{
+	int vref_uv;
+	u32 rem;
+	u64 q;
+
+	vref_uv = ads1299_get_vref_uv(priv);
+	if (vref_uv <= 0)
+		return vref_uv < 0 ? vref_uv : -EINVAL;
+
+	q = div64_u64((u64)vref_uv * MILLIDEGREE_PER_DEGREE * NANO,
+		      (u64)ADS1299_TEMP_UV_PER_C <<
+		      (ADS1299_BITS_PER_SAMPLE - 1));
+	*val = (int)div_u64_rem(q, NANO, &rem);
+	*val2 = (int)rem;
+
+	return IIO_VAL_INT_PLUS_NANO;
+}
+
+static int ads1299_temp_offset(struct ads1299_private *priv, int *val,
+			       int *val2)
+{
+	u64 uv_at_0c = ADS1299_TEMP_UV_AT_25C - 25 * ADS1299_TEMP_UV_PER_C;
+	int vref_uv;
+	u32 rem;
+	u64 q;
+
+	vref_uv = ads1299_get_vref_uv(priv);
+	if (vref_uv <= 0)
+		return vref_uv < 0 ? vref_uv : -EINVAL;
+
+	q = div_u64((uv_at_0c << (ADS1299_BITS_PER_SAMPLE - 1)) * MICRO,
+		    (u32)vref_uv);
+	*val = -(int)div_u64_rem(q, MICRO, &rem);
+	*val2 = (int)rem;
+
+	return IIO_VAL_INT_PLUS_MICRO;
+}
+
+/*
+ * The temperature sensor or a supply, read on a borrowed channel: its CHnSET
+ * saved, the MUX moved there at gain 1, the conversions that carry the change
+ * discarded, one read, and CHnSET put back as it was.
+ */
+static int ads1299_read_internal(struct ads1299_private *priv,
+				 const struct iio_chan_spec *chan, int *val)
+{
+	unsigned int ch = chan->address;
+	unsigned int mux = chan->type == IIO_TEMP ? ADS1299_MUX_TEMPERATURE :
+						    ADS1299_MUX_MVDD;
+	unsigned int saved;
+	unsigned int i;
+	int restore;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(ch), &saved);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->regmap, ADS1299_REG_CHnSET(ch),
+			   (saved & ADS1299_MASK_CH_SRB2) |
+			   FIELD_PREP(ADS1299_MASK_CH_PGA, 0) |
+			   FIELD_PREP(ADS1299_MASK_CH_MUX, mux));
+	for (i = 0; !ret && i <= ADS1299_MUX_DISCARD; i++)
+		ret = ads1299_read_one(priv, ch);
+	if (!ret)
+		*val = ads1299_code(priv, ADS1299_OFFSET_IN_RX_BUFFER(ch));
+
+	restore = regmap_write(priv->regmap, ADS1299_REG_CHnSET(ch), saved);
+
+	return ret ? ret : restore;
+}
+
 static int ads1299_read_raw(struct iio_dev *indio_dev,
 			    struct iio_chan_spec const *chan,
 			    int *val, int *val2, long mask)
@@ -991,18 +1105,26 @@ static int ads1299_read_raw(struct iio_dev *indio_dev,
 		if (ret)
 			return ret;
 
-		ret = ads1299_read_one(priv, chan->scan_index);
+		/* Not in the buffer: the temperature and the supplies */
+		if (chan->scan_index < 0) {
+			ret = ads1299_read_internal(priv, chan, val);
+		} else {
+			ret = ads1299_read_one(priv, chan->scan_index);
+			if (!ret)
+				*val = ads1299_code(priv, chan->address);
+		}
 
 		iio_device_release_direct_mode(indio_dev);
 
-		if (ret)
-			return ret;
-
-		*val = sign_extend32(get_unaligned_be24(priv->rx_buffer + chan->address),
-				     ADS1299_BITS_PER_SAMPLE - 1);
-		return IIO_VAL_INT;
+		return ret ? ret : IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
+		if (chan->type == IIO_TEMP)
+			return ads1299_temp_scale(priv, val, val2);
+		if (chan->scan_index < 0)
+			return ads1299_scale_at_gain(priv, 1, val, val2);
 		return ads1299_get_scale(priv, chan->channel, val, val2);
+	case IIO_CHAN_INFO_OFFSET:
+		return ads1299_temp_offset(priv, val, val2);
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ads1299_get_samp_freq(priv, val);
 	case IIO_CHAN_INFO_HARDWAREGAIN:
@@ -2388,7 +2510,7 @@ static int ads1299_sample_stats(struct ads1299_private *priv, unsigned int count
 		hi[ch] = S32_MIN;
 	}
 
-	for (reading = 0; reading < count + ADS1299_SELF_TEST_DISCARD; reading++) {
+	for (reading = 0; reading < count + ADS1299_MUX_DISCARD; reading++) {
 		ret = ads1299_read_one(priv, 0);
 		if (ret)
 			return ret;
@@ -2407,7 +2529,7 @@ static int ads1299_sample_stats(struct ads1299_private *priv, unsigned int count
 			return -EIO;
 		}
 
-		if (reading < ADS1299_SELF_TEST_DISCARD)
+		if (reading < ADS1299_MUX_DISCARD)
 			continue;
 
 		/* One RDATA carries every channel */
@@ -2554,8 +2676,11 @@ static int ads1299_build_channels(struct iio_dev *indio_dev,
 	struct iio_chan_spec *channels;
 	unsigned int n = priv->num_adc_channels;
 
-	/* n voltage channels, the lead-off word, and a timestamp */
-	channels = devm_kcalloc(dev, n + 2, sizeof(*channels), GFP_KERNEL);
+	/*
+	 * n voltage channels, the lead-off word, a timestamp, and three that
+	 * are read directly and never buffered: the temperature, two supplies.
+	 */
+	channels = devm_kcalloc(dev, n + 5, sizeof(*channels), GFP_KERNEL);
 	if (!channels)
 		return -ENOMEM;
 
@@ -2581,9 +2706,33 @@ static int ads1299_build_channels(struct iio_dev *indio_dev,
 		},
 	};
 	channels[n + 1] = (struct iio_chan_spec)IIO_CHAN_SOFT_TIMESTAMP(n + 1);
+	channels[n + 2] = (struct iio_chan_spec){
+		.type = IIO_TEMP,
+		.address = ADS1299_TEMP_CHANNEL,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				      BIT(IIO_CHAN_INFO_SCALE) |
+				      BIT(IIO_CHAN_INFO_OFFSET),
+		.scan_index = -1,
+	};
+	channels[n + 3] = (struct iio_chan_spec){
+		.type = IIO_VOLTAGE,
+		.extend_name = "mvdd_analog",
+		.address = ADS1299_MVDD_ANALOG_CHANNEL,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				      BIT(IIO_CHAN_INFO_SCALE),
+		.scan_index = -1,
+	};
+	channels[n + 4] = (struct iio_chan_spec){
+		.type = IIO_VOLTAGE,
+		.extend_name = "mvdd_digital",
+		.address = ADS1299_MVDD_DIGITAL_CHANNEL,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				      BIT(IIO_CHAN_INFO_SCALE),
+		.scan_index = -1,
+	};
 
 	indio_dev->channels = channels;
-	indio_dev->num_channels = (int)(n + 2);
+	indio_dev->num_channels = (int)(n + 5);
 
 	return 0;
 }
