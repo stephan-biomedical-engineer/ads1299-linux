@@ -733,32 +733,32 @@ static const struct iio_event_spec ads1299_events[] = {
 	},
 };
 
-#define ADS1299_CHAN(index)				\
-{							\
-	.type = IIO_VOLTAGE,				\
-	.indexed = 1,					\
-	.channel = index,				\
-	.address = ADS1299_OFFSET_IN_RX_BUFFER(index),	\
-	.info_mask_separate =				\
-		BIT(IIO_CHAN_INFO_RAW) |		\
-		BIT(IIO_CHAN_INFO_SCALE) |		\
-		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
-	.info_mask_separate_available =			\
-		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
-	.info_mask_shared_by_all =			\
-		BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
-	.info_mask_shared_by_all_available =		\
-		BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
-	.ext_info = ads1299_ext_info,			\
-	.event_spec = ads1299_events,			\
-	.num_event_specs = ARRAY_SIZE(ads1299_events),	\
-	.scan_index = index,				\
-	.scan_type = {					\
-		.sign = 's',				\
-		.realbits = ADS1299_BITS_PER_SAMPLE,	\
-		.storagebits = 32,			\
-		.endianness = IIO_CPU,			\
-	},						\
+#define ADS1299_CHAN(index)						\
+{									\
+	.type = IIO_VOLTAGE,						\
+	.indexed = 1,							\
+	.channel = index,						\
+	.address = ADS1299_OFFSET_IN_RX_BUFFER(index),			\
+	.info_mask_separate =						\
+		BIT(IIO_CHAN_INFO_RAW) |				\
+		BIT(IIO_CHAN_INFO_SCALE) |				\
+		BIT(IIO_CHAN_INFO_HARDWAREGAIN),			\
+	.info_mask_separate_available =					\
+		BIT(IIO_CHAN_INFO_HARDWAREGAIN),			\
+	.info_mask_shared_by_all =					\
+		BIT(IIO_CHAN_INFO_SAMP_FREQ),				\
+	.info_mask_shared_by_all_available =				\
+		BIT(IIO_CHAN_INFO_SAMP_FREQ),				\
+	.ext_info = ads1299_ext_info,					\
+	.event_spec = ads1299_events,					\
+	.num_event_specs = ARRAY_SIZE(ads1299_events),			\
+	.scan_index = index,						\
+	.scan_type = {							\
+		.sign = 's',						\
+		.realbits = ADS1299_BITS_PER_SAMPLE,			\
+		.storagebits = 32,					\
+		.endianness = IIO_CPU,					\
+	},								\
 }
 
 static const struct iio_chan_spec ads1299_channels[ADS1299_MAX_CHANNELS] = {
@@ -2092,7 +2092,7 @@ static const struct clk_ops ads1299_clk_out_ops = {
  * read-modify-write would copy an output pulled away from its level into the
  * level of another. Writes come from gpio_shadow; only get() reads the part.
  */
-#define ADS1299_NUM_GPIOS		4
+#define ADS1299_NUM_GPIOS			4
 
 static int ads1299_gpio_write(struct ads1299_private *priv)
 {
