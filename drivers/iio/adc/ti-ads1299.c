@@ -226,6 +226,10 @@ static const char * const ads1299_bias_names[] = {
 /* A command takes 4 t_CLK to decode, so register access runs at f_CLK */
 #define ADS1299_SPI_BUS_SPEED_SLOW		ADS1299_CLK_RATE_HZ
 #define ADS1299_SPI_CMD_BUFFER_SIZE		3
+/* [SBAS499 9.4.4.2] The status word opens with 1100b */
+#define ADS1299_MASK_STATUS_SYNC		GENMASK(7, 4)
+#define ADS1299_STATUS_SYNC			0xc0
+
 /* Command byte, status word and n 24-bit samples */
 #define ADS1299_SPI_RDATA_BUFFER_SIZE(n)	(((n) + 1) * 3 + 1)
 #define ADS1299_SPI_RDATA_BUFFER_SIZE_MAX				\
@@ -1352,8 +1356,15 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	if (!indio_dev->name)
 		return -ENOMEM;
 
-	/* CLK high impedance until a consumer prepares the clock output */
+	/*
+	 * DAISY_EN = 0 is daisy-chain mode, whatever the name suggests
+	 * [SBAS499 Table 13]. A single device reads the same in it, with
+	 * DAISY_IN tied to DGND; 1, multiple readback, only repeats data under
+	 * RDATAC, which this driver does not use. CLK stays high impedance
+	 * until a consumer prepares the clock output.
+	 */
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
+				 ADS1299_MASK_CONFIG1_DAISY_EN |
 				 ADS1299_MASK_CONFIG1_CLK_EN, 0);
 	if (ret)
 		return ret;
@@ -1440,6 +1451,18 @@ static int ads1299_sample_stats(struct ads1299_private *priv, unsigned int count
 			return ret;
 
 		msleep(ADS1299_SELF_TEST_INTERVAL_MS);
+
+		/*
+		 * Anything but 1100b means the reply is out of step with the
+		 * part, and what follows it is not samples.
+		 */
+		if ((priv->rx_buffer[1] & ADS1299_MASK_STATUS_SYNC) !=
+		    ADS1299_STATUS_SYNC) {
+			dev_err(&priv->spi->dev,
+				"status word opens with 0x%02x, not 0x%02x\n",
+				priv->rx_buffer[1], ADS1299_STATUS_SYNC);
+			return -EIO;
+		}
 
 		if (reading < ADS1299_SELF_TEST_DISCARD)
 			continue;
@@ -1603,6 +1626,7 @@ static int ads1299_probe(struct spi_device *spi)
 	struct iio_dev *indio_dev;
 	struct device *dev = &spi->dev;
 	struct gpio_desc *reset_gpio;
+	u32 chain = 1;
 	int ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*priv));
@@ -1639,6 +1663,16 @@ static int ads1299_probe(struct spi_device *spi)
 	priv->clk = devm_clk_get_optional_enabled(dev, "clk");
 	if (IS_ERR(priv->clk))
 		return dev_err_probe(dev, PTR_ERR(priv->clk), "Failed to get clk\n");
+
+	/*
+	 * A daisy chain would be read as its first device alone, every other
+	 * channel silently missing, so it is refused rather than half used.
+	 */
+	device_property_read_u32(dev, "#daisy-chained-devices", &chain);
+	if (chain > 1)
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "a daisy chain of %u devices is not supported\n",
+				     chain);
 
 	priv->reg_avdd = devm_regulator_get(dev, "avdd");
 	if (IS_ERR(priv->reg_avdd))
