@@ -785,23 +785,72 @@ static ssize_t input_mux_show(struct device *dev,
 	return sysfs_emit(buf, "%s\n", ads1299_mux_names[mux]);
 }
 
+/*
+ * The test input with the generator off reads an internal node that nothing
+ * drives: this part has no external test pin. A channel is never left there,
+ * so input_mux refuses the test input while the generator is off, and
+ * test_signal refuses "off" while any channel is on the test input. Both
+ * stores hold direct mode, which also orders them against each other.
+ */
+static int ads1299_test_input_selected(struct ads1299_private *priv)
+{
+	unsigned int regval;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < priv->num_adc_channels; i++) {
+		ret = regmap_read(priv->regmap, ADS1299_REG_CHnSET(i), &regval);
+		if (ret)
+			return ret;
+		if (FIELD_GET(ADS1299_MASK_CH_MUX, regval) ==
+		    ADS1299_MUX_TEST_SIGNAL)
+			return 1;
+	}
+
+	return 0;
+}
+
+static int ads1299_generator_on(struct ads1299_private *priv)
+{
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG2, &regval);
+	if (ret)
+		return ret;
+
+	return !!(regval & ADS1299_MASK_CONFIG2_INT_CAL);
+}
+
 static ssize_t input_mux_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t len)
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct ads1299_private *priv = iio_priv(indio_dev);
+	int mux;
 	int ret;
 
-	ret = sysfs_match_string(ads1299_mux_names, buf);
-	if (ret < 0)
-		return ret;
+	mux = sysfs_match_string(ads1299_mux_names, buf);
+	if (mux < 0)
+		return mux;
 
-	ret = ads1299_set_mux(priv, (unsigned int)ret);
+	/* Not while running: every sample would change meaning */
+	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
 
-	return (ssize_t)len;
+	if (mux == ADS1299_MUX_TEST_SIGNAL) {
+		ret = ads1299_generator_on(priv);
+		if (!ret)
+			ret = -EINVAL;
+	}
+	if (ret >= 0)
+		ret = ads1299_set_mux(priv, (unsigned int)mux);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
 }
 
 static ssize_t input_mux_available_show(struct device *dev,
@@ -1008,9 +1057,16 @@ static ssize_t test_signal_store(struct device *dev,
 	if (ret)
 		return ret;
 
-	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
-			   ADS1299_CONFIG2_RESERVED_VALUE |
-			   ads1299_test_signals[i].config2);
+	ret = 0;
+	if (!(ads1299_test_signals[i].config2 & ADS1299_MASK_CONFIG2_INT_CAL)) {
+		ret = ads1299_test_input_selected(priv);
+		if (ret > 0)
+			ret = -EINVAL;
+	}
+	if (!ret)
+		ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
+				   ADS1299_CONFIG2_RESERVED_VALUE |
+				   ads1299_test_signals[i].config2);
 
 	iio_device_release_direct_mode(indio_dev);
 
