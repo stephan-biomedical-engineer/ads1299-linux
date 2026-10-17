@@ -55,6 +55,12 @@ properties:
     maxItems: 1
     description: The active-low RESET input of the converter.
 
+  powerdown-gpios:
+    maxItems: 1
+    description:
+      The active-low PWDN input. When given, the converter is powered down
+      through it in system suspend; otherwise it is put in standby.
+
   clocks:
     maxItems: 1
     description:
@@ -99,6 +105,9 @@ properties:
 
   avdd-supply:
     description: Analog supply.
+
+  dvdd-supply:
+    description: Digital supply.
 
   vref-supply:
     description:
@@ -158,7 +167,9 @@ examples:
             interrupt-parent = <&gpio1>;
             interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
             reset-gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
+            powerdown-gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
             avdd-supply = <&reg_avdd>;
+            dvdd-supply = <&reg_dvdd>;
             gpio-controller;
             #gpio-cells = <2>;
             gpio-line-names = "ADC_GPIO1", "ADC_GPIO2", "", "STATUS_LED";
