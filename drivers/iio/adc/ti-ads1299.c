@@ -18,11 +18,13 @@
  *    offset, then the test generator held at DC; a part that fails is not
  *    registered
  *  - input MUX, test signal and bias drive controls, and the lead-off status
+ *  - the CLK pin as a clock output, for other converters to run from
  */
 
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -32,6 +34,7 @@
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -263,6 +266,7 @@ struct ads1299_private {
 	struct regulator *reg_avdd;
 	struct regulator *reg_vref;
 	struct clk *clk;
+	struct clk_hw clk_out;
 	struct regmap *regmap;
 	struct completion completion;
 	struct spi_transfer rdata_xfer;
@@ -1236,6 +1240,87 @@ static const struct regmap_config ads1299_regmap_config = {
 	.cache_type = REGCACHE_MAPLE,
 };
 
+/*
+ * The CLK pin as a clock output [SBAS499 Table 6]: the internal oscillator,
+ * driven out while CLK_EN is set. Prepare rather than enable, because the bit
+ * is written over SPI, which sleeps.
+ */
+static unsigned long ads1299_clk_out_recalc_rate(struct clk_hw *hw,
+						 unsigned long parent_rate)
+{
+	return ADS1299_CLK_RATE_HZ;
+}
+
+static int ads1299_clk_out_prepare(struct clk_hw *hw)
+{
+	struct ads1299_private *priv =
+		container_of(hw, struct ads1299_private, clk_out);
+
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
+				  ADS1299_MASK_CONFIG1_CLK_EN,
+				  ADS1299_MASK_CONFIG1_CLK_EN);
+}
+
+static void ads1299_clk_out_unprepare(struct clk_hw *hw)
+{
+	struct ads1299_private *priv =
+		container_of(hw, struct ads1299_private, clk_out);
+
+	regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
+			   ADS1299_MASK_CONFIG1_CLK_EN, 0);
+}
+
+static int ads1299_clk_out_is_prepared(struct clk_hw *hw)
+{
+	struct ads1299_private *priv =
+		container_of(hw, struct ads1299_private, clk_out);
+	unsigned int val;
+
+	if (regmap_read(priv->regmap, ADS1299_REG_CONFIG1, &val))
+		return 0;
+
+	return !!(val & ADS1299_MASK_CONFIG1_CLK_EN);
+}
+
+static const struct clk_ops ads1299_clk_out_ops = {
+	.recalc_rate = ads1299_clk_out_recalc_rate,
+	.prepare = ads1299_clk_out_prepare,
+	.unprepare = ads1299_clk_out_unprepare,
+	.is_prepared = ads1299_clk_out_is_prepared,
+};
+
+/*
+ * Registered only when the node is a clock provider. With an external clock
+ * the CLKSEL pin is low and CLK is an input, so there is nothing to drive.
+ */
+static int ads1299_setup_clk_out(struct ads1299_private *priv)
+{
+	struct device *dev = &priv->spi->dev;
+	struct clk_init_data init = { };
+	int ret;
+
+	if (!device_property_present(dev, "#clock-cells"))
+		return 0;
+
+	if (priv->clk)
+		return dev_err_probe(dev, -EINVAL,
+				     "#clock-cells needs the internal oscillator, and clocks names an external one\n");
+
+	init.name = devm_kasprintf(dev, GFP_KERNEL, "%s-clk", dev_name(dev));
+	if (!init.name)
+		return -ENOMEM;
+	device_property_read_string(dev, "clock-output-names", &init.name);
+	init.ops = &ads1299_clk_out_ops;
+	priv->clk_out.init = &init;
+
+	ret = devm_clk_hw_register(dev, &priv->clk_out);
+	if (ret)
+		return ret;
+
+	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get,
+					   &priv->clk_out);
+}
+
 static int ads1299_init(struct iio_dev *indio_dev)
 {
 	struct ads1299_private *priv = iio_priv(indio_dev);
@@ -1266,6 +1351,12 @@ static int ads1299_init(struct iio_dev *indio_dev)
 					 priv->num_adc_channels);
 	if (!indio_dev->name)
 		return -ENOMEM;
+
+	/* CLK high impedance until a consumer prepares the clock output */
+	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG1,
+				 ADS1299_MASK_CONFIG1_CLK_EN, 0);
+	if (ret)
+		return ret;
 
 	/* Internal test generator available but not routed to any channel */
 	ret = regmap_write(priv->regmap, ADS1299_REG_CONFIG2,
@@ -1648,6 +1739,11 @@ static int ads1299_probe(struct spi_device *spi)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "self test failed, front-end not registered\n");
+
+	/* A part that failed is not a clock source for others either */
+	ret = ads1299_setup_clk_out(priv);
+	if (ret)
+		return ret;
 
 	return devm_iio_device_register(dev, indio_dev);
 }
