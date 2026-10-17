@@ -75,6 +75,19 @@ properties:
   clock-output-names:
     maxItems: 1
 
+  gpio-controller:
+    description:
+      GPIO1 to GPIO4 are wired for use as general-purpose pins. Omit when they
+      are tied to DGND, as the datasheet asks of unused ones, so that no pin
+      tied to ground can be driven as an output.
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-line-names:
+    minItems: 1
+    maxItems: 4
+
   '#daisy-chained-devices':
     description:
       Number of converters in the daisy chain, all of the type the compatible
@@ -146,6 +159,9 @@ examples:
             interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
             reset-gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
             avdd-supply = <&reg_avdd>;
+            gpio-controller;
+            #gpio-cells = <2>;
+            gpio-line-names = "ADC_GPIO1", "ADC_GPIO2", "", "STATUS_LED";
         };
     };
   - |
