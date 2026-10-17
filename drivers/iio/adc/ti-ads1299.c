@@ -315,6 +315,116 @@ struct ads1299_private {
 /* Three bytes per sample in RX buffer, starting at offset 4 */
 #define ADS1299_OFFSET_IN_RX_BUFFER(index)	(3 * (index) + 4)
 
+/*
+ * The lead-off comparators are on while anything is sensed: a channel's input
+ * or the bias electrode. They feed LOFF_STATP, LOFF_STATN and BIAS_STAT, and
+ * with nothing sensed every one of those bits means nothing.
+ */
+static int ads1299_update_loff_comparators(struct ads1299_private *priv)
+{
+	unsigned int sensp;
+	unsigned int sensn;
+	unsigned int config3;
+	bool on;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSP, &sensp);
+	if (!ret)
+		ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_SENSN, &sensn);
+	if (!ret)
+		ret = regmap_read(priv->regmap, ADS1299_REG_CONFIG3, &config3);
+	if (ret)
+		return ret;
+
+	on = sensp || sensn || (config3 & ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS);
+
+	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
+				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
+				  on ? ADS1299_MASK_CONFIG4_PD_LOFF_COMP : 0);
+}
+
+/*
+ * Lead-off per channel [SBAS499 9.3.2.4.3]: sensing on the positive input,
+ * on the negative input, and the flip that swaps which of the two the current
+ * pulls to AVDD and which to AVSS. One bit per channel in each register.
+ */
+static const unsigned int ads1299_loff_channel_regs[] = {
+	ADS1299_REG_LOFF_SENSP,
+	ADS1299_REG_LOFF_SENSN,
+	ADS1299_REG_LOFF_FLIP,
+};
+
+static ssize_t ads1299_loff_channel_read(struct iio_dev *indio_dev,
+					 uintptr_t private,
+					 const struct iio_chan_spec *chan,
+					 char *buf)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(priv->regmap, ads1299_loff_channel_regs[private],
+			  &regval);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(regval & BIT(chan->channel)));
+}
+
+static ssize_t ads1299_loff_channel_write(struct iio_dev *indio_dev,
+					  uintptr_t private,
+					  const struct iio_chan_spec *chan,
+					  const char *buf, size_t len)
+{
+	struct ads1299_private *priv = iio_priv(indio_dev);
+	unsigned int reg = ads1299_loff_channel_regs[private];
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	/* Not while running: the lead-off current changes what is measured */
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->regmap, reg, BIT(chan->channel),
+				 on ? BIT(chan->channel) : 0);
+	if (!ret && reg != ADS1299_REG_LOFF_FLIP)
+		ret = ads1299_update_loff_comparators(priv);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+static const struct iio_chan_spec_ext_info ads1299_ext_info[] = {
+	{
+		.name = "lead_off_sense_p",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_loff_channel_read,
+		.write = ads1299_loff_channel_write,
+		.private = 0,
+	},
+	{
+		.name = "lead_off_sense_n",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_loff_channel_read,
+		.write = ads1299_loff_channel_write,
+		.private = 1,
+	},
+	{
+		.name = "lead_off_flip",
+		.shared = IIO_SEPARATE,
+		.read = ads1299_loff_channel_read,
+		.write = ads1299_loff_channel_write,
+		.private = 2,
+	},
+	{ }
+};
+
 #define ADS1299_CHAN(index)				\
 {							\
 	.type = IIO_VOLTAGE,				\
@@ -330,6 +440,7 @@ struct ads1299_private {
 	.info_mask_shared_by_all_available =		\
 		BIT(IIO_CHAN_INFO_SAMP_FREQ) |		\
 		BIT(IIO_CHAN_INFO_HARDWAREGAIN),	\
+	.ext_info = ads1299_ext_info,			\
 	.scan_index = index,				\
 	.scan_type = {					\
 		.sign = 's',				\
@@ -1116,6 +1227,7 @@ static ssize_t lead_off_status_show(struct device *dev,
 	unsigned int sensn;
 	unsigned int statp;
 	unsigned int statn;
+	unsigned int loff;
 	int ret;
 
 	/*
@@ -1134,6 +1246,19 @@ static ssize_t lead_off_status_show(struct device *dev,
 
 	if (!sensp && !sensn)
 		return sysfs_emit(buf, "disabled\n");
+
+	/*
+	 * The comparators are the DC method [SBAS499 9.3.2.4.3.1]. With AC
+	 * excitation the electrode shows in the data, as the amplitude at the
+	 * excitation frequency, and these bits are not its status.
+	 */
+	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF, &loff);
+	if (ret)
+		return ret;
+
+	if (FIELD_GET(ADS1299_MASK_LOFF_FLEAD_OFF, loff) !=
+	    ADS1299_LOFF_FLEAD_OFF_DC)
+		return sysfs_emit(buf, "ac\n");
 
 	ret = regmap_read(priv->regmap, ADS1299_REG_LOFF_STATP, &statp);
 	if (ret)
@@ -1193,16 +1318,12 @@ static ssize_t bias_lead_off_store(struct device *dev,
 	if (ret)
 		return ret;
 
-	/* The comparators first: BIAS_STAT is one of their outputs */
-	ret = 0;
-	if (on)
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
-					 ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
-					 ADS1299_MASK_CONFIG4_PD_LOFF_COMP);
+	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
+				 ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS,
+				 on ? ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS : 0);
+	/* BIAS_STAT is one of the comparators' outputs */
 	if (!ret)
-		ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
-					 ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS,
-					 on ? ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS : 0);
+		ret = ads1299_update_loff_comparators(priv);
 
 	iio_device_release_direct_mode(indio_dev);
 
@@ -1799,13 +1920,17 @@ static int ads1299_init(struct iio_dev *indio_dev)
 	}
 
 	/*
-	 * Lead-off comparators powered on. Not the same as lead-off detection
-	 * being enabled: that needs LOFF_SENSP/LOFF_SENSN per channel, which
-	 * nothing here writes.
+	 * No input sensed and no flip, written; with nothing sensed the
+	 * comparators go off, so no status says an electrode was watched.
 	 */
-	return regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG4,
-				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP,
-				  ADS1299_MASK_CONFIG4_PD_LOFF_COMP);
+	for (i = 0; i < ARRAY_SIZE(ads1299_loff_channel_regs); i++) {
+		ret = regmap_write(priv->regmap,
+				   ads1299_loff_channel_regs[i], 0);
+		if (ret)
+			return ret;
+	}
+
+	return ads1299_update_loff_comparators(priv);
 }
 
 /*
