@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Raspberry Pi overlay for a TI ADS1299 on SPI0.
+ *
+ * Default wiring (BCM GPIO numbers, 40-pin header pins in brackets):
+ *   MOSI GPIO10 [19], MISO GPIO9 [21], SCLK GPIO11 [23], CS CE0 GPIO8 [24]
+ *   DRDY GPIO25 [22]
+ *
+ * Parameters (dtoverlay=ads1299,<param>=<value> in config.txt):
+ *   cs1       use CE1 (GPIO7 [26]) instead of CE0
+ *   drdy      GPIO of DRDY (default 25)
+ *   reset     GPIO of RESET, driven by the driver (default: not connected)
+ *   pwdn      GPIO of PWDN, driven by the driver (default: not connected)
+ *   speed     SPI clock in Hz (default 4000000)
+ *
+ * avdd-supply is a fixed 5 V regulator: change it if the board's analogue
+ * supply is not 5 V (AVDD - AVSS).
+ *
+ * Constants are numeric so that this compiles with plain dtc, without the
+ * kernel headers: 1 = GPIO_ACTIVE_LOW, 2 = IRQ_TYPE_EDGE_FALLING,
+ * 0 = BCM2835_FSEL_GPIO_IN.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&spidev0>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@1 {
+		target = <&spidev1>;
+		__dormant__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@2 {
+		target = <&gpio>;
+		__overlay__ {
+			ads1299_pins: ads1299_pins {
+				brcm,pins = <25>;
+				brcm,function = <0>;
+			};
+		};
+	};
+
+	fragment@3 {
+		target-path = "/";
+		__overlay__ {
+			ads1299_avdd: ads1299-avdd {
+				compatible = "regulator-fixed";
+				regulator-name = "ads1299-avdd";
+				regulator-min-microvolt = <5000000>;
+				regulator-max-microvolt = <5000000>;
+				regulator-always-on;
+			};
+		};
+	};
+
+	fragment@4 {
+		target = <&spi0>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ads1299: adc@0 {
+				compatible = "ti,ads1299";
+				reg = <0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&ads1299_pins>;
+				spi-max-frequency = <4000000>;
+				spi-cpha;
+				interrupt-parent = <&gpio>;
+				interrupts = <25 2>;
+				avdd-supply = <&ads1299_avdd>;
+			};
+		};
+	};
+
+	fragment@5 {
+		target = <&ads1299>;
+		ads1299_reset: __dormant__ {
+			reset-gpios = <&gpio 255 1>;
+		};
+	};
+
+	fragment@6 {
+		target = <&ads1299>;
+		ads1299_pwdn: __dormant__ {
+			powerdown-gpios = <&gpio 255 1>;
+		};
+	};
+
+	__overrides__ {
+		cs1 = <0>, "-0+1",
+		      <&ads1299>, "reg:0=1";
+		drdy = <&ads1299_pins>, "brcm,pins:0",
+		       <&ads1299>, "interrupts:0";
+		reset = <0>, "+5",
+			<&ads1299_reset>, "reset-gpios:4";
+		pwdn = <0>, "+6",
+		       <&ads1299_pwdn>, "powerdown-gpios:4";
+		speed = <&ads1299>, "spi-max-frequency:0";
+	};
+};
