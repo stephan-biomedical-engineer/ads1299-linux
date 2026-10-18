@@ -5,17 +5,23 @@
 #   make                       for the running kernel
 #   make KDIR=/path/to/kernel  for another one (add ARCH= and CROSS_COMPILE=)
 #
-# Kbuild stops the build on a kernel without IIO_EV_TYPE_FAULT.
+# The driver is compiled from a copy in build/, which compat/configure.sh
+# adapts to what the kernel lacks and says what it changed. The module is
+# build/drivers/iio/adc/ti-ads1299.ko.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
+BUILD := $(CURDIR)/build
 
-all modules:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+all modules: configure
+	$(MAKE) -C $(KDIR) M=$(BUILD) modules
+
+configure:
+	@MAKE="$(MAKE)" $(CURDIR)/compat/configure.sh $(KDIR) $(BUILD)
 
 modules_install:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
+	$(MAKE) -C $(KDIR) M=$(BUILD) modules_install
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	rm -rf $(BUILD)
 
-.PHONY: all modules modules_install clean
+.PHONY: all modules configure modules_install clean
