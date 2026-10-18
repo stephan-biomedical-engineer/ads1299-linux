@@ -31,17 +31,29 @@ devicetree properties in `Documentation/devicetree/bindings/iio/adc/ti,ads1299.y
 
 ## Kernel requirements
 
-**Today the driver builds against Linux 6.6 only**, with one patch backported. It was developed
-on STMicroelectronics' `linux-stm32mp` 6.6 for an STM32MP257 board, and the port to current
-mainline is the next step before submission:
+The driver is written against the current mainline API. Built on 2026-10-18:
 
-- It needs `IIO_EV_TYPE_FAULT` / `IIO_EV_DIR_FAULT_OPENWIRE`, which mainline gained in 2025
-  (<https://patch.msgid.link/20250127-ad4111_openwire-v5-1-ef2db05c384f@baylibre.com>). On 6.6
-  that patch is backported. Against a kernel without it the `Makefile` stops with a message
-  rather than failing in the compiler.
-- It still includes `<asm/unaligned.h>` and calls `hrtimer_init()`, as 6.6 does. Mainline moved
-  the first to `<linux/unaligned.h>` in 6.12 and replaces the second with `hrtimer_setup()`, so
-  no mainline release builds it unchanged yet.
+| Kernel | Result |
+|---|---|
+| 7.2.11 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
+| 6.18.57 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
+| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | builds, no errors and no warnings; loaded and run, see below. Built at `97a1774`, before the switch to `iio_for_each_active_channel()` |
+| 6.12.113 (arm64, x86-64) | does not build |
+| 6.8 (Ubuntu 24.04 headers) | does not build |
+
+6.12 and 6.8 lack what the driver uses (6.13 to 6.17 were not tried):
+
+- `IIO_EV_TYPE_FAULT` / `IIO_EV_DIR_FAULT_OPENWIRE`, which mainline gained in 2025
+  (<https://patch.msgid.link/20250127-ad4111_openwire-v5-1-ef2db05c384f@baylibre.com>). Without
+  it the build stops at once with a message naming the kernel source it looked in, rather than
+  failing in the compiler.
+- `iio_device_claim_direct()`, `hrtimer_setup()`, `iio_push_to_buffers_with_ts()`, the `bool`
+  state of `write_event_config()` and the `int` return of a `gpio_chip`'s `set()`, all missing
+  from 6.12; 6.8 also lacks `<linux/unaligned.h>` and `iio_for_each_active_channel()`.
+
+A kernel with the event backported but the older API, such as a 6.12, would pass the first
+check and fail in the compiler; that case was not tried. No compatibility layer for older kernels
+exists yet.
 
 The kernel also needs `CONFIG_SPI`, `CONFIG_COMMON_CLK`, `CONFIG_GPIOLIB`, `CONFIG_IIO`,
 `CONFIG_IIO_BUFFER`, `CONFIG_IIO_KFIFO_BUF` and `CONFIG_REGMAP`.
@@ -67,7 +79,7 @@ sudo dkms install ads1299-linux/0.1
 ```
 
 The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. A kernel without
-`IIO_EV_TYPE_FAULT` fails the DKMS build with the `Makefile`'s message.
+`IIO_EV_TYPE_FAULT` fails the DKMS build with the message above. Not yet exercised with `dkms`.
 
 ## Describing the hardware
 
@@ -106,8 +118,27 @@ obj-$(CONFIG_TI_ADS1299) += ti-ads1299.o
 
 ## What has been tested
 
-On one ADS1299 (`ID = 0x3e`, `REV_ID = 1`), on a PC through a USB-to-SPI bridge, with no DRDY
-interrupt, at room temperature, on 2026-10-17:
+On one ADS1299 (`ID = 0x3e`, `REV_ID = 1`), at room temperature, with nothing connected to the
+electrode inputs.
+
+On a Raspberry Pi 4B, on its own SPI with DRDY as an interrupt, Raspberry Pi OS with Linux
+6.18.50, through `dts/ads1299-overlay.dts`, on 2026-10-18:
+
+- The self test passed at boot and on 10 module reloads; shorted-input noise up to 35 codes,
+  against a limit of 447.
+- Buffered acquisition from the DRDY interrupt, 10 s at 250 SPS: 2497 conversions due, 2497
+  delivered, none lost.
+- The test signal's level on each channel repeated the PC's measurement below within 0.004
+  percentage points.
+- The `openwire` event: with every channel's positive input sensed, one event per open input,
+  timestamped with the conversion that showed it; none for an input held by SRB2, none with the
+  event disabled, none with AC excitation. The inputs were already open when the buffer started:
+  an electrode coming off during an acquisition was not tried.
+- 41 of the PC's 42 ABI checks below; the other expects the timer, and the Pi reports
+  `drdy_irq`.
+
+On a PC through a USB-to-SPI bridge, with no DRDY interrupt, on 2026-10-17, built from the
+same source before its port to the current API:
 
 - The ABI behaves as documented: 42 checks, including 12 refusals of invalid or ill-timed requests.
 - Every setting writes its field at the datasheet's bit position and nothing else: the 24
@@ -120,17 +151,17 @@ interrupt, at room temperature, on 2026-10-17:
 - The self-test limits were measured, not assumed: ±20 % on the test signal is 8 times the worst
   in-spec case, and 10 µV on the noise is 6.25 times the datasheet's guaranteed maximum.
 
-**Not tested yet**: the DRDY interrupt and continuous read (`RDATAC`) up to 16 kSPS, the
-`openwire` event (the PC's kernel lacked the event type), PWDN, the clock output and the
-`gpiochip`, long acquisitions, and any other part or temperature. They need a native SPI host
-with a devicetree that declares them.
+**Not tested yet**: data rates above 250 SPS and continuous read (`RDATAC`), an electrode coming
+off during an acquisition, whether PWDN acts (the board pulls it up, so the probe would pass
+without it), the clock output and the `gpiochip`, suspend, long acquisitions, and any other part
+or temperature.
 
 ## Upstream status
 
 **Not submitted yet.** The series (binding, driver, ABI document) will be posted to the
-`linux-iio` and `devicetree` mailing lists once it is ported to current mainline. This section
-will then link it on [lore.kernel.org](https://lore.kernel.org/linux-iio/), together with each
-revision and its review.
+`linux-iio` and `devicetree` mailing lists. This section will then link it on
+[lore.kernel.org](https://lore.kernel.org/linux-iio/), together with each revision and its
+review.
 
 ## License
 

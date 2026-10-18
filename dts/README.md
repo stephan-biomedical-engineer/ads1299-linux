@@ -47,8 +47,11 @@ A board with another analogue supply needs `regulator-min-microvolt` and
 **Status**: compiled with `dtc` and applied with Raspberry Pi's `dtmerge` to the official
 `bcm2711-rpi-4-b.dtb`, without parameters and with all of them: the converter lands on `spi0` at
 the chosen chip select, the matching `spidev` is disabled, and DRDY, RESET, PWDN and the clock
-take the given values. **Not booted on a Raspberry Pi**. The driver's own kernel requirements
-(see the top-level `README.md`) apply.
+take the given values. Booted on a Raspberry Pi 4B (Raspberry Pi OS, Linux 6.18.50) as
+`dtoverlay=ads1299,drdy=6,pwdn=5` on 2026-10-18: the firmware applied it, the driver bound and
+sampled from the DRDY interrupt (top-level `README.md`, "What has been tested"). The `cs1`,
+`reset` and `speed` parameters were not booted, nor was the default DRDY pin. The driver's own
+kernel requirements apply.
 
 ## Other boards
 
