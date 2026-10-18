@@ -40,14 +40,14 @@ For older kernels, `make` compiles a copy adapted to what the kernel lacks (belo
 | 7.2.11 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
 | 6.18.57 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
 | 6.12.113 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
-| 6.8.0-147-generic (x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
+| 6.8.0-147-generic (x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1`; built and run, see below |
 | 6.6.159 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
-| 6.6.129 with the event backported (arm64) | adapted, with the event | no errors, no warnings, also with `W=1` |
+| 6.6.129 with the event backported (arm64) | adapted, with the event | no errors, no warnings, also with `W=1`; an earlier version of the driver ran on it, see below |
 | 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | unchanged | built and run, see below |
 
-The current source has run on 6.18 alone; the source before the port ran on 6.8, and an earlier
-version of the driver on 6.6 ([What has been tested](#what-has-been-tested)). 6.13 to 6.17 were
-not tried, nor anything before 6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
+The current source has run on 6.18 and 6.8, and an earlier version of the driver on 6.6
+([What has been tested](#what-has-been-tested)). 6.13 to 6.17 were not tried, nor anything before
+6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
 
 ### What the adapted copy changes
 
@@ -153,14 +153,21 @@ On a Raspberry Pi 4B, on its own SPI with DRDY as an interrupt, Raspberry Pi OS 
   `drdy_irq`.
 
 On a PC through a USB-to-SPI bridge (MCP2210), with no DRDY interrupt, Ubuntu with Linux
-6.8.0-147-generic, on 2026-10-17, built from the same source before its port to the current API,
-with the `openwire` event taken off a copy because that kernel lacks it:
+6.8.0-147-generic, on 2026-10-18, built with `make` (the adapted copy, without the `openwire`
+event):
 
+- The self test passed on 10 probes; shorted-input noise 22 to 34 codes.
 - The ABI behaves as documented: 42 checks, including 12 refusals of invalid or ill-timed requests.
 - Every setting writes its field at the datasheet's bit position and nothing else: the 24
   registers, read back past the driver by an independent SPI client, matched the datasheet in nine
   patterns that cover every code of every field (216 of 216), and the driver's register cache
   matched the silicon after each.
+- Buffered acquisition from the host timer, 10 s at 250 SPS: 2499 delivered, none lost.
+
+On the same PC and kernel, on 2026-10-17, built from the same source before its port to the
+current API, with the `openwire` event taken off a copy, the same ABI checks and register patterns
+passed, and:
+
 - The analogue values agree with the datasheet (SBAS499C): shorted-input noise at all seven gains
   (−19 % to +8 % of the typical RMS), test signal plus gain within ±2.5 % (−0.06 % to −0.42 %),
   both supply monitors within 0.2 % of a multimeter.
