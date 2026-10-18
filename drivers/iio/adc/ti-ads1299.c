@@ -1872,8 +1872,7 @@ static void ads1299_rdata_complete(void *context)
 	ads1299_lead_off_state(priv, &offp, &offn);
 	ads1299_lead_off_events(indio_dev, offp, offn, timestamp);
 
-	for_each_set_bit(scan_index, indio_dev->active_scan_mask,
-			 indio_dev->masklength) {
+	iio_for_each_active_channel(indio_dev, scan_index) {
 		const struct iio_chan_spec *scan_chan =
 					&indio_dev->channels[scan_index];
 		const u8 *data;
