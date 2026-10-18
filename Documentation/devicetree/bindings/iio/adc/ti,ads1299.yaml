@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Texas Instruments ADS1299 biopotential analog front-end
 
 maintainers:
-  - stephan-biomedical-engineer <stephanbrrs8@gmail.com>
+  - Stephan Costa Barros <stephanbrrs8@gmail.com>
 
 description: |
   Texas Instruments ADS1299 family: low-noise, 24-bit, simultaneous-sampling
