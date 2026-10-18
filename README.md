@@ -57,6 +57,25 @@ sudo make modules_install
 The module is `drivers/iio/adc/ti-ads1299.ko`. With Secure Boot on, an unsigned module is refused
 at load; sign it with a key enrolled in the machine (MOK).
 
+### With DKMS
+
+DKMS rebuilds the module for every kernel the machine installs:
+
+```sh
+sudo cp -r . /usr/src/ads1299-linux-0.1
+sudo dkms install ads1299-linux/0.1
+```
+
+The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. A kernel without
+`IIO_EV_TYPE_FAULT` fails the DKMS build with the `Makefile`'s message.
+
+## Describing the hardware
+
+The driver binds to a devicetree node; `Documentation/devicetree/bindings/iio/adc/ti,ads1299.yaml`
+lists the properties and gives examples. `dts/` holds an overlay for the Raspberry Pi, with the
+chip select, DRDY, RESET, PWDN and SPI clock as `config.txt` parameters, and says how to compile
+and enable it.
+
 ## Building in tree
 
 Copy the three files to the same paths in a kernel tree, then add to `drivers/iio/adc/Kconfig`:
@@ -105,6 +124,13 @@ interrupt, at room temperature, on 2026-10-17:
 `openwire` event (the PC's kernel lacked the event type), PWDN, the clock output and the
 `gpiochip`, long acquisitions, and any other part or temperature. They need a native SPI host
 with a devicetree that declares them.
+
+## Upstream status
+
+**Not submitted yet.** The series (binding, driver, ABI document) will be posted to the
+`linux-iio` and `devicetree` mailing lists once it is ported to current mainline. This section
+will then link it on [lore.kernel.org](https://lore.kernel.org/linux-iio/), together with each
+revision and its review.
 
 ## License
 
