@@ -9,7 +9,9 @@
 #   -r REV    revision to build (default HEAD)
 #   -p PATCH  apply PATCH to each copy before building (repeatable)
 #   -W        build with W=1
-#   -C        also run sparse on the driver (C=1); its warnings count in "warn"
+#   -C        also run sparse on the driver (C=1); its warnings count in "warn".
+#             A kernel that finds sparse too old skips it: the line says so and
+#             the exit status is 1
 #   -o DIR    keep copies and logs in DIR (default: a new temporary directory)
 #   FILTER    only targets whose name contains one of these strings
 #
@@ -158,6 +160,11 @@ for t in "${TARGETS[@]}"; do
 		failed=1
 	fi
 	read -r e w l < <(count "$dir/build.log")
+	# A kernel that finds sparse too old skips it without failing.
+	if [ -n "$C" ] && [ $res = ok ] && ! grep -q '^  CHECK ' "$dir/build.log"; then
+		l="$l (sparse did not run)"
+		failed=1
+	fi
 	printf "$FMT" "$name" "$fault" "$gate" "$res" "$e" "$w" "$l"
 
 	# Errors hidden behind a missing header.
