@@ -82,6 +82,12 @@ sudo make modules_install
 The module is `build/drivers/iio/adc/ti-ads1299.ko`; `make clean` removes `build/`. With Secure
 Boot on, an unsigned module is refused at load; sign it with a key enrolled in the machine (MOK).
 
+On Ubuntu 24.04 (6.8.0-147-generic, 2026-10-18), `modules_install` copied the module to
+`/lib/modules/$(uname -r)/updates/` but left it unsigned, because the headers package carries no
+signing key, and skipped `depmod`, for lack of `System.map`. There, sign the installed module
+and run `sudo depmod -a`, or use DKMS, which does both. Use one or the other: two copies under
+`updates/` can shadow each other.
+
 ### With DKMS
 
 DKMS rebuilds the module for every kernel the machine installs:
@@ -199,11 +205,6 @@ On an STM32MP257F-DK, with ST's Linux 6.6.129, through the same USB bridge, from
 - 30 min of acquisition at 250 SPS: 0.67 % of the samples lost on the USB link, as counted by the
   driver.
 - SRB1 (`montage`), written through the driver, seen in the signal on one channel.
-
-**Not tested yet**: data rates above 250 SPS and continuous read (`RDATAC`), an electrode coming
-off during an acquisition, whether PWDN acts (the board pulls it up, so the probe would pass
-without it), the clock output and the `gpiochip`, suspend, long acquisitions, and any other part
-or temperature.
 
 ## Upstream status
 
