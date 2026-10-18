@@ -43,7 +43,7 @@ For older kernels, `make` compiles a copy adapted to what the kernel lacks (belo
 | 6.8 (Ubuntu 24.04 headers, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
 | 6.6.159 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
 | 6.6.129 with the event backported (arm64) | adapted, with the event | no errors, no warnings, also with `W=1` |
-| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | unchanged | built and run, see below; built before the copy in `build/` existed, not rebuilt since |
+| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | unchanged | built and run, see below |
 
 Only building was checked: the current source has run on 6.18 alone. 6.13 to 6.17 were not tried, nor
 anything before 6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
