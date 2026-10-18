@@ -301,7 +301,7 @@ struct ads1299_private {
 	/* Demux target. Must stay 8-byte aligned for the timestamp channel. */
 	struct {
 		u32 chan[ADS1299_MAX_CHANNELS + 1];	/* + lead-off word */
-		s64 timestamp __aligned(8);
+		aligned_s64 timestamp;
 	} scan;
 
 	/* For synchronous SPI exchanges (read/write registers) */
