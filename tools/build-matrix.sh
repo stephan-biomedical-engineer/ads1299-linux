@@ -22,24 +22,25 @@
 # Columns:
 #   FAULT   IIO_EV_TYPE_FAULT in the kernel's uapi types.h, looked up in
 #           KDIR and in KDIR/source (an O= output directory links the source there)
-#   gate    what the revision's own build decides, run as the README says
-#           (make KDIR=...) in a copy of its own: "stop" when it refuses the
-#           kernel for lacking IIO_EV_TYPE_FAULT, "pass" otherwise
-#   build   the module built with kbuild directly (make -C KDIR M=copy), in a
-#           copy whose Kbuild is only the obj-m line, so with no gate, and with
-#           KBUILD_MODPOST_WARN=1
+#   make    the revision built as the README says (make KDIR=...), in a copy of
+#           its own: "ok", "FAIL", or "stop" when an old revision's gate refuses
+#           the kernel for lacking IIO_EV_TYPE_FAULT. Then its err and warn.
+#   raw     the driver's source alone, built with kbuild directly
+#           (make -C KDIR M=copy) from a copy whose Kbuild is only the obj-m
+#           line: no gate, no compatibility layer. Then its err, warn, lines.
+#   Both builds pass KBUILD_MODPOST_WARN=1.
 #   err/warn  compiler "error:"/"warning:" lines, plus modpost ERROR/WARNING.
 #           Not counted: modpost's undefined-symbol warnings and "Module.symvers
 #           is missing", because modules_prepare writes no Module.symvers and
 #           every external symbol is then reported (hence KBUILD_MODPOST_WARN)
-#   lines   source lines of the errors
+#   lines   source lines of the raw build's errors
 #
 # A compiler stops at a missing header, which hides every other error. When
-# that happens a second pass supplies the header (asm/unaligned.h as a wrapper
-# of linux/unaligned.h, anything else empty) and reports what was behind it,
-# marked "+hdr".
+# that happens in the raw build, a second pass supplies the header
+# (asm/unaligned.h as a wrapper of linux/unaligned.h, anything else empty) and
+# reports what was behind it, marked "+hdr".
 #
-# Exit status: 0 when every target built, 1 otherwise.
+# Exit status: 0 when make built on every target, 1 otherwise.
 
 set -u
 
@@ -133,8 +134,8 @@ kbuild() {
 }
 
 printf 'rev %s, logs in %s\n\n' "$SHA" "$OUT"
-FMT='%-28s %-5s %-5s %-6s %4s %5s  %s\n'
-printf "$FMT" kernel FAULT gate build err warn lines
+FMT='%-24s %-5s %-5s %3s %4s  %-5s %3s %4s  %s\n'
+printf "$FMT" kernel FAULT make err warn raw err warn lines
 failed=0
 for t in "${TARGETS[@]}"; do
 	IFS='|' read -r name kdir args <<<"$t"
@@ -149,29 +150,31 @@ for t in "${TARGETS[@]}"; do
 
 	if has_fault "$kdir"; then fault=yes; else fault=no; fi
 
-	cp -a "$dir/src" "$dir/gate"
+	# As the README builds.
+	cp -a "$dir/src" "$dir/make"
 	# shellcheck disable=SC2086
-	make -C "$dir/gate" KDIR="$kdir" $args KBUILD_MODPOST_WARN=1 >"$dir/gate.log" 2>&1
-	if grep -q 'has no IIO_EV_TYPE_FAULT' "$dir/gate.log"; then
-		gate=stop
+	if make -C "$dir/make" KDIR="$kdir" $args KBUILD_MODPOST_WARN=1 \
+		${W:+W=1} ${C:+C=1} >"$dir/make.log" 2>&1; then
+		mres=ok
+	elif grep -q 'has no IIO_EV_TYPE_FAULT' "$dir/make.log"; then
+		mres=stop
 	else
-		gate=pass
+		mres=FAIL
 	fi
-	echo 'obj-m := drivers/iio/adc/ti-ads1299.o' >"$dir/src/Kbuild"
+	[ $mres = ok ] || failed=1
+	read -r me mw _ < <(count "$dir/make.log")
 
-	if kbuild "$kdir" "$dir/src" "$dir/build.log" "$args"; then
-		res=ok
-	else
-		res=FAIL
-		failed=1
-	fi
+	# The source alone.
+	echo 'obj-m := drivers/iio/adc/ti-ads1299.o' >"$dir/src/Kbuild"
+	kbuild "$kdir" "$dir/src" "$dir/build.log" "$args" && res=ok || res=FAIL
 	read -r e w l < <(count "$dir/build.log")
+
 	# A kernel that finds sparse too old skips it without failing.
-	if [ -n "$C" ] && [ $res = ok ] && ! grep -q '^  CHECK ' "$dir/build.log"; then
+	if [ -n "$C" ] && [ $mres = ok ] && ! grep -q '^  CHECK ' "$dir/make.log"; then
 		l="$l (sparse did not run)"
 		failed=1
 	fi
-	printf "$FMT" "$name" "$fault" "$gate" "$res" "$e" "$w" "$l"
+	printf "$FMT" "$name" "$fault" "$mres" "$me" "$mw" "$res" "$e" "$w" "$l"
 
 	# Errors hidden behind a missing header.
 	log=$dir/build.log
@@ -190,7 +193,7 @@ for t in "${TARGETS[@]}"; do
 		log=$dir/build-hdr$pass.log
 		kbuild "$kdir" "$dir/src" "$log" "$args" "-I$shim" && r=ok || r=FAIL
 		read -r e w l < <(count "$log")
-		printf "$FMT" "  +hdr $hdr" "" "" "$r" "$e" "$w" "$l"
+		printf "$FMT" "  +hdr $hdr" "" "" "" "" "$r" "$e" "$w" "$l"
 	done
 done
 exit $failed
