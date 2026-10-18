@@ -2156,15 +2156,16 @@ static int ads1299_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	return !!(regval & BIT(offset + ADS1299_NUM_GPIOS));
 }
 
-static void ads1299_gpio_set(struct gpio_chip *gc, unsigned int offset,
-			     int value)
+static int ads1299_gpio_set(struct gpio_chip *gc, unsigned int offset,
+			    int value)
 {
 	struct ads1299_private *priv = gpiochip_get_data(gc);
 
 	guard(mutex)(&priv->gpio_lock);
 
 	ads1299_gpio_set_level(priv, offset, value);
-	ads1299_gpio_write(priv);
+
+	return ads1299_gpio_write(priv);
 }
 
 /*
