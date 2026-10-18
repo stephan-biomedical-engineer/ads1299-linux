@@ -22,9 +22,12 @@
 # Columns:
 #   FAULT   IIO_EV_TYPE_FAULT in the kernel's uapi types.h, looked up in
 #           KDIR and in KDIR/source (an O= output directory links the source there)
-#   gate    what the copy's own Makefile decides: "make check": pass or stop
-#   build   the module built with kbuild directly (make -C KDIR M=copy),
-#           bypassing the Makefile, with KBUILD_MODPOST_WARN=1
+#   gate    what the revision's own build decides, run as the README says
+#           (make KDIR=...) in a copy of its own: "stop" when it refuses the
+#           kernel for lacking IIO_EV_TYPE_FAULT, "pass" otherwise
+#   build   the module built with kbuild directly (make -C KDIR M=copy), in a
+#           copy whose Kbuild is only the obj-m line, so with no gate, and with
+#           KBUILD_MODPOST_WARN=1
 #   err/warn  compiler "error:"/"warning:" lines, plus modpost ERROR/WARNING.
 #           Not counted: modpost's undefined-symbol warnings and "Module.symvers
 #           is missing", because modules_prepare writes no Module.symvers and
@@ -146,12 +149,15 @@ for t in "${TARGETS[@]}"; do
 
 	if has_fault "$kdir"; then fault=yes; else fault=no; fi
 
+	cp -a "$dir/src" "$dir/gate"
 	# shellcheck disable=SC2086
-	if make -s -C "$dir/src" KDIR="$kdir" $args check >"$dir/check.log" 2>&1; then
-		gate=pass
-	else
+	make -C "$dir/gate" KDIR="$kdir" $args KBUILD_MODPOST_WARN=1 >"$dir/gate.log" 2>&1
+	if grep -q 'has no IIO_EV_TYPE_FAULT' "$dir/gate.log"; then
 		gate=stop
+	else
+		gate=pass
 	fi
+	echo 'obj-m := drivers/iio/adc/ti-ads1299.o' >"$dir/src/Kbuild"
 
 	if kbuild "$kdir" "$dir/src" "$dir/build.log" "$args"; then
 		res=ok
