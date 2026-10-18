@@ -40,13 +40,14 @@ For older kernels, `make` compiles a copy adapted to what the kernel lacks (belo
 | 7.2.11 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
 | 6.18.57 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
 | 6.12.113 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
-| 6.8 (Ubuntu 24.04 headers, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
+| 6.8.0-147-generic (x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
 | 6.6.159 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
 | 6.6.129 with the event backported (arm64) | adapted, with the event | no errors, no warnings, also with `W=1` |
 | 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | unchanged | built and run, see below |
 
-Only building was checked: the current source has run on 6.18 alone. 6.13 to 6.17 were not tried, nor
-anything before 6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
+The current source has run on 6.18 alone; the source before the port ran on 6.8, and an earlier
+version of the driver on 6.6 ([What has been tested](#what-has-been-tested)). 6.13 to 6.17 were
+not tried, nor anything before 6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
 
 ### What the adapted copy changes
 
@@ -151,8 +152,9 @@ On a Raspberry Pi 4B, on its own SPI with DRDY as an interrupt, Raspberry Pi OS 
 - 41 of the PC's 42 ABI checks below; the other expects the timer, and the Pi reports
   `drdy_irq`.
 
-On a PC through a USB-to-SPI bridge, with no DRDY interrupt, on 2026-10-17, built from the
-same source before its port to the current API:
+On a PC through a USB-to-SPI bridge (MCP2210), with no DRDY interrupt, Ubuntu with Linux
+6.8.0-147-generic, on 2026-10-17, built from the same source before its port to the current API,
+with the `openwire` event taken off a copy because that kernel lacks it:
 
 - The ABI behaves as documented: 42 checks, including 12 refusals of invalid or ill-timed requests.
 - Every setting writes its field at the datasheet's bit position and nothing else: the 24
@@ -164,6 +166,14 @@ same source before its port to the current API:
   both supply monitors within 0.2 % of a multimeter.
 - The self-test limits were measured, not assumed: ±20 % on the test signal is 8 times the worst
   in-spec case, and 10 µV on the noise is 6.25 times the datasheet's guaranteed maximum.
+
+On an STM32MP257F-DK, with ST's Linux 6.6.129, through the same USB bridge, from 2026-10-04 to
+2026-10-10, with an earlier version of the driver, not this source:
+
+- The self test passed at boot, and again after the bridge was unplugged and plugged back in.
+- 30 min of acquisition at 250 SPS: 0.67 % of the samples lost on the USB link, as counted by the
+  driver.
+- SRB1 (`montage`), written through the driver, seen in the signal on one channel.
 
 **Not tested yet**: data rates above 250 SPS and continuous read (`RDATAC`), an electrode coming
 off during an acquisition, whether PWDN acts (the board pulls it up, so the probe would pass
