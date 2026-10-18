@@ -4,26 +4,18 @@
 #
 #   make                       for the running kernel
 #   make KDIR=/path/to/kernel  for another one (add ARCH= and CROSS_COMPILE=)
+#
+# Kbuild stops the build on a kernel without IIO_EV_TYPE_FAULT.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-# The driver reports open electrodes as IIO_EV_TYPE_FAULT /
-# IIO_EV_DIR_FAULT_OPENWIRE. A kernel without that event type cannot build it.
-HAS_FAULT_EVENT := $(shell grep -qs IIO_EV_TYPE_FAULT \
-	$(KDIR)/include/uapi/linux/iio/types.h && echo y)
-
-all modules: check
+all modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
-modules_install: check
+modules_install:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 
-check:
-ifneq ($(HAS_FAULT_EVENT),y)
-	$(error $(KDIR) has no IIO_EV_TYPE_FAULT: see README.md, "Kernel requirements")
-endif
-
-.PHONY: all modules modules_install clean check
+.PHONY: all modules modules_install clean
