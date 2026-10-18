@@ -20,6 +20,9 @@ dtc -@ -Wno-unit_address_vs_reg -I dts -O dtb -o ads1299.dtbo ads1299-overlay.dt
 sudo cp ads1299.dtbo /boot/firmware/overlays/    # /boot/overlays/ on older releases
 ```
 
+Each [release](https://github.com/stephan-biomedical-engineer/ads1299-linux/releases) carries
+`ads1299.dtbo` compiled by that command, so that only the copy is needed.
+
 Then enable it in `config.txt` (`/boot/firmware/config.txt`, or `/boot/config.txt` on older
 releases) and reboot:
 
