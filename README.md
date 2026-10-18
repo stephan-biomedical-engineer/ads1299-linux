@@ -37,7 +37,7 @@ The driver is written against the current mainline API. Built on 2026-10-18:
 |---|---|
 | 7.2.11 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
 | 6.18.57 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
-| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | builds, no errors and no warnings; loaded and run, see below. Built at `97a1774`, before the switch to `iio_for_each_active_channel()` |
+| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | builds with plain `make`; loaded and run, see below |
 | 6.12.113 (arm64, x86-64) | does not build |
 | 6.8 (Ubuntu 24.04 headers) | does not build |
 
