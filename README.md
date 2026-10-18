@@ -87,12 +87,28 @@ Boot on, an unsigned module is refused at load; sign it with a key enrolled in t
 DKMS rebuilds the module for every kernel the machine installs:
 
 ```sh
-sudo cp -r . /usr/src/ads1299-linux-0.1
+sudo mkdir /usr/src/ads1299-linux-0.1
+git archive HEAD | sudo tar -x -C /usr/src/ads1299-linux-0.1
 sudo dkms install ads1299-linux/0.1
 ```
 
-The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. Not yet exercised with
-`dkms`.
+The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. `git archive` copies the
+source without `build/`, which a plain copy would carry over from an earlier build.
+
+With Secure Boot on, Ubuntu's DKMS signs with `/var/lib/shim-signed/mok/MOK.priv`, and creates
+that key, to be enrolled at the next boot, if it is missing. To sign with a key already enrolled,
+say so before the first build:
+
+```sh
+sudo mkdir -p /etc/dkms/framework.conf.d
+printf 'mok_signing_key="%s"\nmok_certificate="%s"\n' /path/to/MOK.priv /path/to/MOK.der |
+	sudo tee /etc/dkms/framework.conf.d/mok.conf
+```
+
+Exercised on Ubuntu 24.04 with DKMS 3.0.11, on 2026-10-18: `dkms install` built, signed and
+installed the module for the running 6.8.0-147-generic, and it ran (below); the hook that the
+package manager calls for a new kernel built, signed and installed it for 6.8.0-146-generic, which
+was not booted.
 
 ## Describing the hardware
 
@@ -163,6 +179,8 @@ event):
   patterns that cover every code of every field (216 of 216), and the driver's register cache
   matched the silicon after each.
 - Buffered acquisition from the host timer, 10 s at 250 SPS: 2499 delivered, none lost.
+- Built and installed by DKMS instead: the self test passed (shorted-input noise 213 codes, still
+  under the limit of 447), and the 42 ABI checks again; 2498 delivered and 1 lost of 2499.
 
 On the same PC and kernel, on 2026-10-17, built from the same source before its port to the
 current API, with the `openwire` event taken off a copy, the same ABI checks and register patterns
