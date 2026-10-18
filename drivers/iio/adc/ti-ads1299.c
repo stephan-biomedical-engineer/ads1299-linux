@@ -2727,8 +2727,8 @@ static int ads1299_probe(struct spi_device *spi)
 	} else {
 		int freq;
 
-		hrtimer_init(&priv->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		priv->timer.function = ads1299_timer_fired;
+		hrtimer_setup(&priv->timer, ads1299_timer_fired, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL);
 
 		if (ads1299_get_samp_freq(priv, &freq) == IIO_VAL_INT && freq > 0)
 			priv->timer_period = ns_to_ktime(div_u64(NSEC_PER_SEC, (u32)freq));
