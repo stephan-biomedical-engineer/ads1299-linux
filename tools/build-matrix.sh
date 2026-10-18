@@ -108,7 +108,7 @@ count() {
 	local e w l
 	e=$(grep -Ec ': (fatal )?error:|^ERROR:' "$1")
 	w=$(grep -E ': warning:|^WARNING:' "$1" |
-	    grep -Evc '^WARNING: modpost: ("[^"]+" \[.*\] undefined!|suppressed [0-9]+ unresolved)|^WARNING: Module.symvers is missing')
+	    grep -Evc '^WARNING: modpost: ("[^"]+" \[.*\] undefined!|suppressed [0-9]+ unresolved)|^WARNING: (.*/)?Module\.symvers is missing')
 	l=$(grep -Eo 'ti-ads1299\.c:[0-9]+:[0-9]+: (fatal )?error:' "$1" |
 	    cut -d: -f2 | sort -nu | paste -sd, -)
 	echo "$e $w ${l:--}"
