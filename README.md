@@ -31,29 +31,41 @@ devicetree properties in `Documentation/devicetree/bindings/iio/adc/ti,ads1299.y
 
 ## Kernel requirements
 
-The driver is written against the current mainline API. Built on 2026-10-18:
+The driver is written against the current mainline API, and builds unchanged on 6.18 and later.
+For older kernels, `make` compiles a copy adapted to what the kernel lacks (below). Built on
+2026-10-18 with `make`:
 
-| Kernel | Result |
-|---|---|
-| 7.2.11 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
-| 6.18.57 (arm64, x86-64) | builds, no errors and no warnings, also with `W=1` |
-| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | builds with plain `make`; loaded and run, see below |
-| 6.12.113 (arm64, x86-64) | does not build |
-| 6.8 (Ubuntu 24.04 headers) | does not build |
+| Kernel | Copy | Result |
+|---|---|---|
+| 7.2.11 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
+| 6.18.57 (arm64, x86-64) | unchanged | no errors, no warnings, also with `W=1` |
+| 6.12.113 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
+| 6.8 (Ubuntu 24.04 headers, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
+| 6.6.159 (arm64, x86-64) | adapted, no `openwire` event | no errors, no warnings, also with `W=1` |
+| 6.6.129 with the event backported (arm64) | adapted, with the event | no errors, no warnings, also with `W=1` |
+| 6.18.50+rpt-rpi-v8 (Raspberry Pi OS, on the Pi) | unchanged | built and run, see below; built before the copy in `build/` existed, not rebuilt since |
 
-6.12 and 6.8 lack what the driver uses (6.13 to 6.17 were not tried):
+Only building was checked: the current source has run on 6.18 alone. 6.13 to 6.17 were not tried, nor
+anything before 6.6; the driver needs `<linux/cleanup.h>`, from 6.5.
 
-- `IIO_EV_TYPE_FAULT` / `IIO_EV_DIR_FAULT_OPENWIRE`, which mainline gained in 2025
-  (<https://patch.msgid.link/20250127-ad4111_openwire-v5-1-ef2db05c384f@baylibre.com>). Without
-  it the build stops at once with a message naming the kernel source it looked in, rather than
-  failing in the compiler.
-- `iio_device_claim_direct()`, `hrtimer_setup()`, `iio_push_to_buffers_with_ts()`, the `bool`
-  state of `write_event_config()` and the `int` return of a `gpio_chip`'s `set()`, all missing
-  from 6.12; 6.8 also lacks `<linux/unaligned.h>` and `iio_for_each_active_channel()`.
+### What the adapted copy changes
 
-A kernel with the event backported but the older API, such as a 6.12, would pass the first
-check and fail in the compiler; that case was not tried. No compatibility layer for older kernels
-exists yet.
+`make` asks the kernel's own build system where its source is, looks up each feature in its
+headers, and writes `build/`. It detects features rather than versions, because distributions
+backport them. It prints what it adapted and what the copy loses. The driver in
+`drivers/iio/adc` is never changed, and on 6.18 and 7.2 the copy is identical to it.
+
+| The kernel lacks | The copy | It loses |
+|---|---|---|
+| `IIO_EV_TYPE_FAULT` / `IIO_EV_DIR_FAULT_OPENWIRE` (mainline gained them in 2025, <https://patch.msgid.link/20250127-ad4111_openwire-v5-1-ef2db05c384f@baylibre.com>) | takes the event off the channels | the `openwire` event; lead-off stays in every buffered sample and in `lead_off_status` |
+| the `int` return of a `gpio_chip`'s `set()` | wraps the driver's `set()` in a `void` one | the error of a GPIO write, which that kernel cannot take |
+| `iio_push_to_buffers_with_ts()` | calls `iio_push_to_buffers_with_timestamp()` | the check of the scan buffer's size |
+| the `bool` state of `write_event_config()` | wraps the driver's in one taking an `int` | nothing |
+| `iio_device_claim_direct()`, `hrtimer_setup()`, `iio_for_each_active_channel()` | defines them over the older calls (`compat/ads1299-compat.h`) | nothing |
+| `<linux/unaligned.h>` | provides it over `<asm/unaligned.h>` | nothing |
+
+Each change to the copy is checked by count: if the driver no longer contains what a change
+expects, `make` stops and says so instead of compiling something else.
 
 The kernel also needs `CONFIG_SPI`, `CONFIG_COMMON_CLK`, `CONFIG_GPIOLIB`, `CONFIG_IIO`,
 `CONFIG_IIO_BUFFER`, `CONFIG_IIO_KFIFO_BUF` and `CONFIG_REGMAP`.
@@ -66,8 +78,8 @@ make KDIR=/path/to/kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
 sudo make modules_install
 ```
 
-The module is `drivers/iio/adc/ti-ads1299.ko`. With Secure Boot on, an unsigned module is refused
-at load; sign it with a key enrolled in the machine (MOK).
+The module is `build/drivers/iio/adc/ti-ads1299.ko`; `make clean` removes `build/`. With Secure
+Boot on, an unsigned module is refused at load; sign it with a key enrolled in the machine (MOK).
 
 ### With DKMS
 
@@ -78,8 +90,8 @@ sudo cp -r . /usr/src/ads1299-linux-0.1
 sudo dkms install ads1299-linux/0.1
 ```
 
-The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. A kernel without
-`IIO_EV_TYPE_FAULT` fails the DKMS build with the message above. Not yet exercised with `dkms`.
+The version in that path has to match `PACKAGE_VERSION` in `dkms.conf`. Not yet exercised with
+`dkms`.
 
 ## Describing the hardware
 
@@ -90,7 +102,9 @@ and enable it.
 
 ## Building in tree
 
-Copy the three files to the same paths in a kernel tree, then add to `drivers/iio/adc/Kconfig`:
+In a kernel tree the driver needs what mainline has from 6.18 on: the adapted copy exists only
+for building out of tree. Copy the three files to the same paths, then add to
+`drivers/iio/adc/Kconfig`:
 
 ```
 config TI_ADS1299
