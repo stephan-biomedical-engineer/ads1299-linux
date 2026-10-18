@@ -410,9 +410,8 @@ static ssize_t ads1299_channel_bit_write(struct iio_dev *indio_dev,
 	if (ret)
 		return ret;
 
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = regmap_update_bits(priv->regmap, reg, BIT(chan->channel),
 				 on ? BIT(chan->channel) : 0);
@@ -421,7 +420,7 @@ static ssize_t ads1299_channel_bit_write(struct iio_dev *indio_dev,
 	if (!ret && sense)
 		ret = ads1299_cache_loff(priv);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -552,9 +551,8 @@ static ssize_t ads1299_mux_write(struct iio_dev *indio_dev, uintptr_t private,
 		return mux;
 
 	/* Not while running: the channel's samples would change meaning */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = 0;
 	if (mux == ADS1299_MUX_TEST_SIGNAL) {
@@ -565,7 +563,7 @@ static ssize_t ads1299_mux_write(struct iio_dev *indio_dev, uintptr_t private,
 	if (ret >= 0)
 		ret = ads1299_set_mux(priv, chan->channel, mux);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -614,16 +612,15 @@ static ssize_t ads1299_srb2_write(struct iio_dev *indio_dev, uintptr_t private,
 		return ret;
 
 	/* Not while running: the channel would measure another difference */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = regmap_update_bits(priv->regmap,
 				 ADS1299_REG_CHnSET(chan->channel),
 				 ADS1299_MASK_CH_SRB2,
 				 on ? ADS1299_MASK_CH_SRB2 : 0);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -1028,9 +1025,8 @@ static int ads1299_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		ret = iio_device_claim_direct_mode(indio_dev);
-		if (ret)
-			return ret;
+		if (!iio_device_claim_direct(indio_dev))
+			return -EBUSY;
 
 		/* Not in the buffer: the temperature and the supplies */
 		if (chan->scan_index < 0) {
@@ -1041,7 +1037,7 @@ static int ads1299_read_raw(struct iio_dev *indio_dev,
 				*val = ads1299_code(priv, chan->address);
 		}
 
-		iio_device_release_direct_mode(indio_dev);
+		iio_device_release_direct(indio_dev);
 
 		return ret ? ret : IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
@@ -1093,9 +1089,8 @@ static int ads1299_write_raw(struct iio_dev *indio_dev,
 	struct ads1299_private *priv = iio_priv(indio_dev);
 	int ret;
 
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
@@ -1109,7 +1104,7 @@ static int ads1299_write_raw(struct iio_dev *indio_dev,
 		break;
 	}
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret;
 }
@@ -1254,13 +1249,12 @@ static ssize_t bias_drive_store(struct device *dev,
 		return on;
 
 	/* Not while running: the samples would change meaning mid-stream */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = ads1299_set_bias(priv, on);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -1358,9 +1352,8 @@ static ssize_t test_signal_store(struct device *dev,
 		return -EINVAL;
 
 	/* Not while running: a test channel's samples would change meaning */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = 0;
 	if (!(ads1299_test_signals[i].config2 & ADS1299_MASK_CONFIG2_INT_CAL)) {
@@ -1373,7 +1366,7 @@ static ssize_t test_signal_store(struct device *dev,
 				   ADS1299_CONFIG2_RESERVED_VALUE |
 				   ads1299_test_signals[i].config2);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -1476,9 +1469,8 @@ static ssize_t bias_lead_off_store(struct device *dev,
 		return on;
 
 	/* Not while running: the lead-off current changes what is measured */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_CONFIG3,
 				 ADS1299_MASK_CONFIG3_BIAS_LOFF_SENS,
@@ -1487,7 +1479,7 @@ static ssize_t bias_lead_off_store(struct device *dev,
 	if (!ret)
 		ret = ads1299_update_loff_comparators(priv);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -1593,16 +1585,15 @@ static ssize_t ads1299_loff_store(struct device *dev,
 		return code;
 
 	/* Not while running: current and thresholds change what is measured */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_LOFF, mask,
 				 ((unsigned int)code << __ffs(mask)) & mask);
 	if (!ret)
 		ret = ads1299_cache_loff(priv);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
@@ -1661,15 +1652,14 @@ static ssize_t montage_store(struct device *dev, struct device_attribute *attr,
 		return referential;
 
 	/* Not while running: every sample would measure another difference */
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
 
 	ret = regmap_update_bits(priv->regmap, ADS1299_REG_MISC1,
 				 ADS1299_MASK_MISC1_SRB1,
 				 referential ? ADS1299_MASK_MISC1_SRB1 : 0);
 
-	iio_device_release_direct_mode(indio_dev);
+	iio_device_release_direct(indio_dev);
 
 	return ret ? ret : (ssize_t)len;
 }
