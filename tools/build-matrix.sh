@@ -4,11 +4,12 @@
 # Build a git revision of the driver against every test kernel, each in its
 # own copy, and print one line per kernel.
 #
-#   tools/build-matrix.sh [-r REV] [-p PATCH]... [-W] [-o DIR] [FILTER]...
+#   tools/build-matrix.sh [-r REV] [-p PATCH]... [-W] [-C] [-o DIR] [FILTER]...
 #
 #   -r REV    revision to build (default HEAD)
 #   -p PATCH  apply PATCH to each copy before building (repeatable)
 #   -W        build with W=1
+#   -C        also run sparse on the driver (C=1); its warnings count in "warn"
 #   -o DIR    keep copies and logs in DIR (default: a new temporary directory)
 #   FILTER    only targets whose name contains one of these strings
 #
@@ -42,12 +43,14 @@ die() { echo "build-matrix: $*" >&2; exit 2; }
 REV=HEAD
 PATCHES=()
 W=
+C=
 OUT=
-while getopts "r:p:Wo:h" opt; do
+while getopts "r:p:WCo:h" opt; do
 	case $opt in
 	r) REV=$OPTARG ;;
 	p) PATCHES+=("$(realpath "$OPTARG")") || exit 2 ;;
 	W) W=1 ;;
+	C) C=1 ;;
 	o) OUT=$OPTARG ;;
 	h) sed -n '3,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
 	*) exit 2 ;;
@@ -58,6 +61,9 @@ FILTERS=("$@")
 
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel) || die "not in a git tree"
 SHA=$(git -C "$REPO" rev-parse --short "$REV^{commit}") || die "bad revision $REV"
+if [ -n "$C" ] && ! command -v sparse >/dev/null; then
+	die "-C needs sparse (apt install sparse)"
+fi
 KERNELS=${KERNELS:-$HOME/Documents/TCC/kernels}
 
 if [ -n "$OUT" ]; then
@@ -117,7 +123,7 @@ count() {
 # kbuild KDIR SRC LOG ARGS [KCFLAGS]
 kbuild() {
 	# shellcheck disable=SC2086
-	make -C "$1" M="$2" KBUILD_MODPOST_WARN=1 ${W:+W=1} $4 \
+	make -C "$1" M="$2" KBUILD_MODPOST_WARN=1 ${W:+W=1} ${C:+C=1} $4 \
 		${5:+KCFLAGS="$5"} modules >"$3" 2>&1
 }
 
