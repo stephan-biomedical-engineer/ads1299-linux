@@ -1894,7 +1894,8 @@ static void ads1299_rdata_complete(void *context)
 	/* rx_buffer can be overwritten from this point on */
 	ads1299_rdata_release_busy_or_restart(priv);
 
-	iio_push_to_buffers_with_timestamp(indio_dev, &priv->scan, timestamp);
+	iio_push_to_buffers_with_ts(indio_dev, &priv->scan, sizeof(priv->scan),
+				    timestamp);
 }
 
 static void ads1299_sample_due(struct ads1299_private *priv)
